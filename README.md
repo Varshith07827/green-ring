@@ -22,7 +22,7 @@ anywhere via a queue — and archive every message, both directions, in MongoDB.
 | --------------------------------------- | ------------------------------------------------------------------- |
 | `repo/`                                 | [OpenWA](https://github.com/rmyndharis/OpenWA), unmodified upstream |
 | `bridge/`                               | The Python service — the part you talk to                           |
-| `worker/`                               | Cloudflare Worker queue for the pull model (optional)               |
+| `.env`                                  | The only file you configure — six settings                          |
 | `start.ps1`                             | Starts everything                                                   |
 | `OpenWA-Bridge.postman_collection.json` | Import into Postman                                                 |
 
@@ -63,20 +63,11 @@ curl.exe http://localhost:8000/health
 Every run after the first is just `.\start.ps1` — it skips setup, install and build when they are
 already done.
 
-### If you're also redeploying the queue
+### The queue is not part of this
 
-The Worker is separate and lives on Cloudflare, so a fresh clone of this repo doesn't touch it. Only
-if you're rebuilding that too:
-
-```powershell
-cd worker
-npm install
-npx wrangler login
-npx wrangler d1 create wa-queue        # paste the id into wrangler.toml
-npx wrangler d1 execute wa-queue --remote --file=./schema.sql
-npx wrangler secret put API_TOKEN      # same value as POLL_TOKEN in bridge\.env
-npx wrangler deploy
-```
+The Cloudflare Worker that holds queued messages is deployed separately and keeps running on its
+own — a fresh clone of this repo neither installs nor touches it. All this side needs is `POLL_URL`
+and `POLL_TOKEN` pointing at it.
 
 ---
 
@@ -207,10 +198,13 @@ than lost.
 
 ### The queue — deployed and live
 
-`worker/` is a Hono + TypeScript Cloudflare Worker, **already deployed** as `whatsapp-webhook-api`,
-serving both verbs on `/wam`: `POST` queues a message, `GET` hands one over and marks it delivered.
-Messages wait in a D1 database called `wa-queue`. Auth is the `API_TOKEN` secret, which matches
-`POLL_TOKEN` in `bridge\.env`.
+A Hono + TypeScript Cloudflare Worker, **deployed and live** as `whatsapp-webhook-api`, serving both
+verbs on `/wam`: `POST` queues a message, `GET` hands one over and marks it delivered. Messages wait
+in a D1 database called `wa-queue`. Auth is its `API_TOKEN` secret, which matches `POLL_TOKEN` in
+`.env`.
+
+> **Its source is not in this repo** — it was removed in `ca7b0d9`. The deployed Worker keeps
+> running regardless, but there is currently nothing to rebuild it from if it needs changing.
 
 ```
 https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam
@@ -233,13 +227,6 @@ curl.exe --% -X POST https://whatsapp-webhook-api.alonewalker07827.workers.dev/w
 
 Answers `202 {"success":true,"message":"Message queued","data":{"id":"…"}}`, and the message goes out
 within a poll interval.
-
-To redeploy after editing `worker/src/`:
-
-```powershell
-cd worker
-npx wrangler deploy
-```
 
 Your own server works just as well — the Worker is only one implementation of the two verbs. Point
 `POLL_URL` anywhere that honours the contract above.

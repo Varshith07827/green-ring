@@ -13,40 +13,35 @@ $python = Join-Path $bridge ".venv\Scripts\python.exe"
 
 $env:Path = "C:\Program Files\nodejs;C:\Program Files\Git\usr\bin;" + $env:Path
 
-# ---- first run: write the two .env files ---------------------------------
-# They are gitignored (they hold secrets), so a fresh clone has neither. They
-# also share a secret: the bridge authenticates to the gateway with the key the
-# gateway is configured to accept. Generating both together is what keeps that
-# pair in step - setting them by hand is where a fresh install usually breaks.
+# ---- configuration -------------------------------------------------------
+# One file, at the project root, gitignored because it holds secrets. The
+# gateway's own repo\.env is GENERATED from it below on every run - so the key
+# they share cannot drift apart, and machine facts like the Chrome path never
+# have to be typed by hand.
 
+$rootEnv = Join-Path $root ".env"
 $repoEnv = Join-Path $repo ".env"
-$bridgeEnv = Join-Path $bridge ".env"
 
-if (-not (Test-Path $repoEnv) -or -not (Test-Path $bridgeEnv)) {
+function Read-EnvFile([string]$path) {
+    $map = @{}
+    if (Test-Path $path) {
+        foreach ($line in Get-Content $path) {
+            if ($line -match '^([A-Z_]+)=(.*)$') { $map[$Matches[1]] = $Matches[2] }
+        }
+    }
+    return $map
+}
+
+function New-Secret([int]$bytes) {
+    $b = New-Object byte[] $bytes
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+    return ($b | ForEach-Object { $_.ToString("x2") }) -join ""
+}
+
+if (-not (Test-Path $rootEnv)) {
     Write-Host ""
     Write-Host "  First run - setting up configuration." -ForegroundColor Cyan
     Write-Host ""
-
-    function New-Secret([int]$bytes) {
-        $b = New-Object byte[] $bytes
-        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
-        return ($b | ForEach-Object { $_.ToString("x2") }) -join ""
-    }
-
-    $gatewayKey = New-Secret 32   # shared: API_MASTER_KEY <-> OPENWA_API_KEY
-    $bridgeKey = New-Secret 24    # what Postman sends to /send
-    $eventsSecret = New-Secret 24 # signs gateway -> bridge deliveries
-
-    # Chrome is required: dependencies install without Puppeteer's own copy.
-    $chrome = @(
-        "C:\Program Files\Google\Chrome\Application\chrome.exe",
-        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $chrome) {
-        Write-Error "Google Chrome not found. Install it, then run this again."
-    }
-    Write-Host "  Chrome:  $chrome" -ForegroundColor DarkGray
 
     $mongo = Read-Host "  MongoDB URI [mongodb://localhost:27017]"
     if (-not $mongo) { $mongo = "mongodb://localhost:27017" }
@@ -54,7 +49,70 @@ if (-not (Test-Path $repoEnv) -or -not (Test-Path $bridgeEnv)) {
     $pollToken = ""
     if ($pollUrl) { $pollToken = Read-Host "  Bearer token for that URL" }
 
-    if (-not (Test-Path $repoEnv)) {
+    $bridgeKey = New-Secret 24
+@"
+# ===========================================================================
+# Configuration - this is the only file you edit.
+#
+# repo\.env is generated from this one by start.ps1 on every run. Don't edit
+# that; your changes get overwritten.
+# ===========================================================================
+
+# --- Set these -------------------------------------------------------------
+
+# Where every message is archived, both directions.
+MONGO_URI=$mongo
+
+# The queue the bridge collects outgoing messages from, so you can send from
+# any machine. Leave both blank to turn that off and send only from this one.
+POLL_URL=$pollUrl
+POLL_TOKEN=$pollToken
+
+# --- Generated once - keep them secret, no need to change them -------------
+
+# What you send from Postman:  Authorization: Bearer <this>
+BRIDGE_API_KEY=$bridgeKey
+
+# Shared with the WhatsApp gateway. start.ps1 copies it into repo\.env.
+OPENWA_API_KEY=$(New-Secret 32)
+
+# Signs the gateway's internal event deliveries to the bridge.
+EVENTS_SECRET=$(New-Secret 24)
+
+# --- Optional --------------------------------------------------------------
+# Everything else has a working default and only belongs here if you are
+# changing it. The common ones:
+#
+#   BRIDGE_PORT=8000            the port Postman talks to
+#   BRIDGE_HOST=0.0.0.0         127.0.0.1 to refuse everything but this machine
+#   POLL_INTERVAL=3             seconds between queue checks
+#   DEFAULT_COUNTRY_CODE=       e.g. 91 to accept bare 10-digit numbers
+#   LOG_LEVEL=info              debug for more detail
+#   MONGO_DB=openwa             database name
+#   OPENWA_SESSION_NAME=default which WhatsApp session to drive
+"@ | Set-Content -Path $rootEnv -Encoding utf8
+
+    Write-Host "  wrote .env" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  Your key for sending messages (Authorization: Bearer ...):" -ForegroundColor Cyan
+    Write-Host "  $bridgeKey" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ---- regenerate the gateway's config from it, every run ------------------
+
+$conf = Read-EnvFile $rootEnv
+$gatewayKey = $conf["OPENWA_API_KEY"]
+if (-not $gatewayKey) { Write-Error "OPENWA_API_KEY is missing from .env" }
+
+# Chrome is required: dependencies install without Puppeteer's own copy.
+$chrome = @(
+    "C:\Program Files\Google\Chrome\Application\chrome.exe",
+    "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $chrome) { Write-Error "Google Chrome not found. Install it, then run this again." }
+
 @"
 # OpenWA gateway - local configuration, generated by start.ps1
 PORT=2785
@@ -89,51 +147,6 @@ CACHE_ENABLED=false
 API_MASTER_KEY=$gatewayKey
 CSP_UPGRADE_INSECURE_REQUESTS=false
 "@ | Set-Content -Path $repoEnv -Encoding utf8
-        Write-Host "  wrote repo\.env" -ForegroundColor Green
-    }
-
-    if (-not (Test-Path $bridgeEnv)) {
-@"
-# OpenWA bridge - generated by start.ps1
-BRIDGE_HOST=0.0.0.0
-BRIDGE_PORT=8000
-BRIDGE_API_KEY=$bridgeKey
-LOG_LEVEL=info
-
-MONGO_URI=$mongo
-MONGO_DB=openwa
-MONGO_COLLECTION=messages
-MONGO_EVENTS_COLLECTION=events
-STORE_RAW_EVENTS=true
-
-# Poll this URL for messages to send. Empty disables polling.
-POLL_URL=$pollUrl
-POLL_TOKEN=$pollToken
-POLL_INTERVAL=3
-POLL_TIMEOUT=15
-
-OPENWA_BASE_URL=http://127.0.0.1:2785
-OPENWA_API_KEY=$gatewayKey
-OPENWA_SESSION_NAME=default
-OPENWA_TIMEOUT=30
-
-EVENTS_PATH=/webhooks/openwa
-EVENTS_SECRET=$eventsSecret
-EVENTS_URL=http://127.0.0.1:8000/webhooks/openwa
-EVENTS_AUTO_REGISTER=true
-EVENTS_SUBSCRIBE=message.received,message.sent,message.ack,message.failed,message.revoked,message.edited,session.status
-
-DEFAULT_COUNTRY_CODE=
-"@ | Set-Content -Path $bridgeEnv -Encoding utf8
-        Write-Host "  wrote bridge\.env" -ForegroundColor Green
-    }
-
-    Write-Host ""
-    Write-Host "  Your key for sending messages (Authorization: Bearer ...):" -ForegroundColor Cyan
-    Write-Host "  $bridgeKey" -ForegroundColor Yellow
-    Write-Host "  Also saved as BRIDGE_API_KEY in bridge\.env" -ForegroundColor DarkGray
-    Write-Host ""
-}
 
 # ---- first run: install and build ----------------------------------------
 

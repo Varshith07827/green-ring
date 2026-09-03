@@ -1,4 +1,14 @@
-"""Configuration for the OpenWA bridge, loaded from bridge/.env."""
+"""Configuration, loaded from the single `.env` at the project root.
+
+One file configures everything. Only six settings have no usable default, and
+those are the whole of what a person edits; the rest of the fields below are
+defaults that are correct on every install and stay out of the file entirely.
+
+The gateway (Node) reads its own `repo/.env`, which `start.ps1` **generates**
+from this one on every run. That file is a build artifact, not somewhere to
+edit: it carries machine facts like the Chrome path, and it copies the gateway
+key from here so the two can never drift apart.
+"""
 
 from functools import lru_cache
 from pathlib import Path
@@ -7,7 +17,8 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-ENV_FILE = BASE_DIR / ".env"
+PROJECT_ROOT = BASE_DIR.parent
+ENV_FILE = PROJECT_ROOT / ".env"
 
 PLACEHOLDERS = {"", "change-me", "changeme", "replace-me", "your-key-here"}
 
