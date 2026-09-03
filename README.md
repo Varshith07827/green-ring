@@ -28,18 +28,28 @@ anywhere via a queue — and archive every message, both directions, in MongoDB.
 
 ---
 
-## Running it
+## Setting it up from scratch
+
+On a machine with **Node**, **Python** and **Google Chrome** installed:
 
 ```powershell
+git clone https://github.com/Varshith07827/green-ring.git
+cd green-ring
 .\start.ps1
 ```
 
-First run installs and builds; after that it just starts. Two windows open — the gateway and the
-bridge — and the script prints what to do next.
+That's the whole thing. The first run asks three questions — your MongoDB URI, the queue URL to poll
+(blank to skip), and its bearer token — then writes both `.env` files, installs dependencies, builds,
+and starts the two processes. It prints your `BRIDGE_API_KEY`; that's the token Postman sends.
+
+The `.env` files are deliberately **not** in the repo, since they hold secrets. They also share one:
+the bridge authenticates to the gateway with the key the gateway is configured to accept. `start.ps1`
+generates both together, which is what keeps that pair in step — setting them by hand is where a
+fresh install usually goes wrong.
 
 **Then, once:** open <http://localhost:2785>, start the `default` session and scan the QR from
-WhatsApp → Settings → Linked devices → Link a device. The session already exists — the bridge
-creates it at startup — so you only press start and scan. The pairing survives restarts
+WhatsApp → Settings → Linked devices → Link a device. The session already exists — the bridge creates
+it at startup — so you only press start and scan. The pairing survives restarts
 (`AUTO_START_SESSIONS=true`, session data in `repo\data\sessions`), so this is a one-time step.
 
 Check it took:
@@ -49,6 +59,24 @@ curl.exe http://localhost:8000/health
 ```
 
 `{"ok":true,...,"session":{"status":"ready","phone":"91..."}}` means you are live.
+
+Every run after the first is just `.\start.ps1` — it skips setup, install and build when they are
+already done.
+
+### If you're also redeploying the queue
+
+The Worker is separate and lives on Cloudflare, so a fresh clone of this repo doesn't touch it. Only
+if you're rebuilding that too:
+
+```powershell
+cd worker
+npm install
+npx wrangler login
+npx wrangler d1 create wa-queue        # paste the id into wrangler.toml
+npx wrangler d1 execute wa-queue --remote --file=./schema.sql
+npx wrangler secret put API_TOKEN      # same value as POLL_TOKEN in bridge\.env
+npx wrangler deploy
+```
 
 ---
 
@@ -177,43 +205,44 @@ over. For the same reason the bridge **does not poll at all while the session is
 send that fails after a message was handed over is written to MongoDB with `status: "failed"` rather
 than lost.
 
-### A queue to poll
+### The queue — deployed and live
 
-`worker/` holds a ready Cloudflare Worker with both verbs on `/wam`: `POST` queues a message, `GET`
-hands one over and marks it delivered.
+`worker/` is a Hono + TypeScript Cloudflare Worker, **already deployed** as `whatsapp-webhook-api`,
+serving both verbs on `/wam`: `POST` queues a message, `GET` hands one over and marks it delivered.
+Messages wait in a D1 database called `wa-queue`. Auth is the `API_TOKEN` secret, which matches
+`POLL_TOKEN` in `bridge\.env`.
+
+```
+https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam
+```
 
 Two details in the `GET` half matter. It **dequeues** — a row goes out once, then is marked
 delivered; an endpoint that re-served the same row would make the bridge send it forever. And when
-nothing is waiting it returns an **empty body (204)**, never a status envelope: a reply like
-`{"success":true,"message":"No messages"}` is indistinguishable from a queued message whose text is
-"No messages", and those two words would go out to somebody.
+nothing is waiting it returns an **empty body (204)**, never a status envelope, for the reason in
+*Nothing without a recipient is ever sent* above.
 
 It uses D1 rather than KV on purpose — KV is eventually consistent, so two polls seconds apart can
 both read the same pending row and send the message twice. The claim is
-`UPDATE … WHERE delivered_at IS NULL`; a losing racer returns empty.
-
-```powershell
-cd worker
-npx wrangler d1 create wa-queue      # put the id in wrangler.toml
-npx wrangler d1 execute wa-queue --remote --file=./schema.sql
-npx wrangler secret put QUEUE_TOKEN
-npx wrangler deploy
-```
-
-Then in `bridge\.env`:
-
-```
-POLL_URL=https://wa-queue.<your-subdomain>.workers.dev/wam
-POLL_TOKEN=<the QUEUE_TOKEN you set>
-```
+`UPDATE … WHERE delivered_at IS NULL`; a losing racer hands over nothing.
 
 Queue a message from any PC:
 
 ```bash
-curl.exe --% -X POST https://wa-queue.<sub>.workers.dev/wam -H "Authorization: Bearer <QUEUE_TOKEN>" -H "Content-Type: application/json" -d "{\"id\":\"919876543210\",\"msg\":\"Hello\"}"
+curl.exe --% -X POST https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam -H "Authorization: Bearer <API_TOKEN>" -H "Content-Type: application/json" -d "{\"id\":\"919876543210\",\"msg\":\"Hello\"}"
 ```
 
-Your own server works just as well — the Worker is only a reference implementation of the two verbs.
+Answers `202 {"success":true,"message":"Message queued","data":{"id":"…"}}`, and the message goes out
+within a poll interval.
+
+To redeploy after editing `worker/src/`:
+
+```powershell
+cd worker
+npx wrangler deploy
+```
+
+Your own server works just as well — the Worker is only one implementation of the two verbs. Point
+`POLL_URL` anywhere that honours the contract above.
 
 ---
 
@@ -259,9 +288,9 @@ the bridge key and event-signing secret are random values for this install. What
 | Setting          | Note                                                                                  |
 | ---------------- | ------------------------------------------------------------------------------------- |
 | `MONGO_URI`      | Currently the **local MongoDB service** on this machine, verified working. Change it to archive elsewhere. |
-| `POLL_URL`       | Your queue endpoint. Set — polling is on.                                             |
-| `POLL_TOKEN`     | Bearer token sent with each poll.                                                     |
-| `WEBHOOK_TOKEN`  | **Empty — put your bearer token here.**                                               |
+| `POLL_URL`       | Your queue endpoint. Set to the deployed Worker — polling is on.                       |
+| `POLL_TOKEN`     | Bearer token sent with each poll. Matches the Worker's `API_TOKEN` secret.             |
+| `POLL_INTERVAL`  | Seconds between polls (3). Raise it if your endpoint is on shared hosting.             |
 | `BRIDGE_API_KEY` | The bearer token Postman sends as `Authorization: Bearer <key>`.                       |
 
 Both `.env` files hold secrets — keep them off GitHub (`bridge\.gitignore` covers its own).
@@ -317,5 +346,6 @@ cd bridge
 .\.venv\Scripts\python.exe scripts\selftest.py
 ```
 
-63 checks over auth (both header styles), number parsing, the send path, every event branch, and the poll loop's parsing, dedup
-rules and failure handling — with MongoDB and the gateway stubbed out.
+65 checks over auth (both header styles), number parsing, the send path, every event branch, and the
+poll loop's parsing, dedup rules, refusals and failure handling — with MongoDB and the gateway
+stubbed out.
