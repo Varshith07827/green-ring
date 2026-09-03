@@ -1,0 +1,58 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+.dev.vars
+**/.dev.vars
+
+# Dependencies and local environments
+node_modules/
+**/node_modules/
+.venv/
+**/.venv/
+venv/
+**/venv/
+
+# Build output and caches
+dist/
+**/dist/
+build/
+**/build/
+coverage/
+**/coverage/
+.wrangler/
+**/.wrangler/
+*.tsbuildinfo
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Runtime data and local storage
+data/
+**/data/
+media/
+**/media/
+uploads/
+**/uploads/
+.wwebjs_auth/
+.wwebjs_cache/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Preserve the original nested repository metadata outside the uploaded tree
+repo/.git.source-backup/

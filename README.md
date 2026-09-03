@@ -1,0 +1,321 @@
+# OpenWA Bridge
+
+Send WhatsApp messages by POSTing `{"id": "<phone>", "msg": "<text>"}` — from this machine, or from
+anywhere via a queue — and archive every message, both directions, in MongoDB.
+
+```
+                         Remote desktop
+   ┌────────────────────────────────────────────────────┐
+   │  bridge (Python, :8000)                            │
+   │    POST /send  {id, msg}  ──────────┐              │
+   │    GET  POLL_URL every 3s ──────────┤              │
+   │                                     ▼              │
+   │  OpenWA gateway (Node, :2785) ── headless Chrome ──┼──► WhatsApp
+   │                    │                               │
+   │       events       ▼                               │
+   └──────────────────────┬─────────────────────────────┘
+                          ▼  every message, both directions
+                       MongoDB
+```
+
+| Path                                    | What it is                                                          |
+| --------------------------------------- | ------------------------------------------------------------------- |
+| `repo/`                                 | [OpenWA](https://github.com/rmyndharis/OpenWA), unmodified upstream |
+| `bridge/`                               | The Python service — the part you talk to                           |
+| `worker/`                               | Cloudflare Worker queue for the pull model (optional)               |
+| `start.ps1`                             | Starts everything                                                   |
+| `OpenWA-Bridge.postman_collection.json` | Import into Postman                                                 |
+
+---
+
+## Running it
+
+```powershell
+.\start.ps1
+```
+
+First run installs and builds; after that it just starts. Two windows open — the gateway and the
+bridge — and the script prints what to do next.
+
+**Then, once:** open <http://localhost:2785>, start the `default` session and scan the QR from
+WhatsApp → Settings → Linked devices → Link a device. The session already exists — the bridge
+creates it at startup — so you only press start and scan. The pairing survives restarts
+(`AUTO_START_SESSIONS=true`, session data in `repo\data\sessions`), so this is a one-time step.
+
+Check it took:
+
+```powershell
+curl.exe http://localhost:8000/health
+```
+
+`{"ok":true,...,"session":{"status":"ready","phone":"91..."}}` means you are live.
+
+---
+
+## Sending
+
+```
+POST http://localhost:8000/send
+Authorization: Bearer <BRIDGE_API_KEY from bridge\.env>
+Content-Type: application/json
+
+{ "id": "919876543210", "msg": "Hello from Postman" }
+```
+
+**One endpoint for every chat.** The recipient is `id` in the body — there is no per-chat URL to
+bind, register, or keep in step. Any chat reachable from the linked number can be messaged
+immediately.
+
+```json
+{
+  "ok": true,
+  "messageId": "true_919876543210@c.us_3EB0ABCD",
+  "chatId": "919876543210@c.us",
+  "status": "sent",
+  "storedId": "66d3f1..."
+}
+```
+
+**`id`** is the phone number *with country code*. `+91 98765-43210`, `919876543210` and
+`00919876543210` all work — spaces, `+`, dashes and brackets are stripped. A group id
+(`120363...@g.us`) passes through untouched, so the same endpoint sends to groups.
+
+A number with no country code is **rejected**, so a message cannot silently go to the wrong country.
+Set `DEFAULT_COUNTRY_CODE=91` in `bridge\.env` to accept bare national numbers instead.
+
+**`msg`** is text, 1–4096 characters. `number`/`to`/`phone` and `message`/`text`/`body` are accepted
+as aliases.
+
+| Method | Path               | Auth  | Purpose                                                     |
+| ------ | ------------------ | ----- | ----------------------------------------------------------- |
+| `POST` | `/send`            | token | Send a message to any chat, by `id`                         |
+| `GET`  | `/health`          | —     | Mongo + gateway + session state                             |
+| `GET`  | `/messages`        | token | Recent messages from Mongo (`limit`, `chatId`, `direction`) |
+| `GET`  | `/session`         | token | Full session detail                                         |
+| `GET`  | `/qr`              | token | Pairing QR as a PNG data URL                                |
+| `POST` | `/events/register` | token | Recreate the session + event subscription                   |
+| `GET`  | `/docs`            | —     | Swagger UI                                                  |
+
+Auth is `Authorization: Bearer <BRIDGE_API_KEY>` (`X-API-Key: <key>` is still accepted). `401` is a
+missing or wrong token, `400` a bad number or a session that is not ready, `422` a malformed body.
+
+> The bridge listens on `0.0.0.0:8000`, so anything that can route to this machine can reach it —
+> other PCs on the LAN, or the internet if a port is forwarded to it. From a machine that *cannot*
+> route here, a direct `POST /send` will not arrive; that direction needs the bridge reachable
+> (LAN, VPN, port forward, or a tunnel).
+
+---
+
+## Sending from anywhere: the pull model
+
+`POST /send` needs this machine to be reachable. Polling does not — the bridge dials **out**, so a PC
+anywhere can queue a message on your server and it goes out from here with no tunnel, no open port
+and nothing routable about this desktop.
+
+```
+  any PC ──POST {id,msg}──► your server ◄──GET every 3s── bridge ──► WhatsApp
+                              (queue)      returns and
+                                           forgets the message
+```
+
+Set `POLL_URL` in `bridge\.env` and it starts. One URL, two verbs: `POST` queues a message, `GET`
+asks "anything waiting to go out?".
+
+What a poll response may return:
+
+```json
+{ "id": "919876543210", "msg": "Hello", "_id": "queue-42" }
+```
+
+- **`id` is the destination.** `msg` is the text (`message`/`text`/`content`/`body`/`reply` also work),
+  and `to`/`number`/`phone`/`chatId` also name the destination.
+- **`_id` is the dedup key** — also `message_id`/`messageId`/`external_id`/`uid`. Optional but worth
+  sending.
+- An **array** sends every message in it, not just the first.
+- An **empty body** or `{}` means nothing is waiting.
+
+### Nothing without a recipient is ever sent
+
+One rule closes off a whole family of accidents: **a poll response can only produce a message if it
+names who the message is for.** No destination, nothing sent — no exceptions, no default, no way to
+configure one.
+
+It matters because a status body looks exactly like a message. `{"success":true,"message":"No
+messages"}` has a `message` field, and without this rule the bridge would send a stranger the words
+*"No messages"*. The same goes for `{"success":true,"message":"Message sent"}`, an error body, a bare
+JSON string, and an HTML login page served where an API was expected — each is refused, and each is
+logged saying why.
+
+Refusing an envelope never means losing what it wraps: a real message nested inside one
+(`{"success":true,"message":"OK","data":{"id":"91…","msg":"the real one"}}`) is still found and sent.
+
+There used to be a `POLL_DEFAULT_ID` setting that supplied a recipient when the payload named none —
+a leftover from the per-chat model. It was the only route by which a status envelope could reach a
+real person, so it is gone.
+
+### `id` means destination here — a deliberate break from winspark
+
+In the system this replaces, `id` in the poll response was the *dedup key*
+(`external_id = obj.get("id")`), and the destination came from which per-chat URL was polled. Now
+that one URL serves every chat, `id` has to carry the recipient instead — so the dedup key was moved
+to `_id` and friends, and `id` is **never** read as an identity. Had it stayed, the first message to a
+number would send and every later message to that same number would be silently dropped as a
+duplicate.
+
+### Deduplication
+
+1. **An explicit message id is authoritative** — seen before, skipped, permanently. The record lives
+   in MongoDB (`poll_claims`), so a restart does not resend a backlog.
+2. **Without one, only a consecutive repeat is suppressed** — the same text to the same chat twice in
+   a row.
+3. **An endpoint that has ever answered empty is exempt from rule 2**, because answering empty proves
+   it dequeues, and a dequeuing endpoint never offers the same message twice.
+
+Rule 3 exists because rule 2 does real damage to a dequeuing endpoint: suppressing a message there
+does not defer it, it **destroys** it — the endpoint already dropped it from its queue to hand it
+over. For the same reason the bridge **does not poll at all while the session is not `ready`**, and a
+send that fails after a message was handed over is written to MongoDB with `status: "failed"` rather
+than lost.
+
+### A queue to poll
+
+`worker/` holds a ready Cloudflare Worker with both verbs on `/wam`: `POST` queues a message, `GET`
+hands one over and marks it delivered.
+
+Two details in the `GET` half matter. It **dequeues** — a row goes out once, then is marked
+delivered; an endpoint that re-served the same row would make the bridge send it forever. And when
+nothing is waiting it returns an **empty body (204)**, never a status envelope: a reply like
+`{"success":true,"message":"No messages"}` is indistinguishable from a queued message whose text is
+"No messages", and those two words would go out to somebody.
+
+It uses D1 rather than KV on purpose — KV is eventually consistent, so two polls seconds apart can
+both read the same pending row and send the message twice. The claim is
+`UPDATE … WHERE delivered_at IS NULL`; a losing racer returns empty.
+
+```powershell
+cd worker
+npx wrangler d1 create wa-queue      # put the id in wrangler.toml
+npx wrangler d1 execute wa-queue --remote --file=./schema.sql
+npx wrangler secret put QUEUE_TOKEN
+npx wrangler deploy
+```
+
+Then in `bridge\.env`:
+
+```
+POLL_URL=https://wa-queue.<your-subdomain>.workers.dev/wam
+POLL_TOKEN=<the QUEUE_TOKEN you set>
+```
+
+Queue a message from any PC:
+
+```bash
+curl.exe --% -X POST https://wa-queue.<sub>.workers.dev/wam -H "Authorization: Bearer <QUEUE_TOKEN>" -H "Content-Type: application/json" -d "{\"id\":\"919876543210\",\"msg\":\"Hello\"}"
+```
+
+Your own server works just as well — the Worker is only a reference implementation of the two verbs.
+
+---
+
+## What lands in MongoDB
+
+Database `openwa`, collection `messages`. One document per WhatsApp message, both directions:
+
+```json
+{
+  "sessionName": "default",
+  "messageId": "true_919876543210@c.us_3EB0ABCD",
+  "direction": "out",
+  "chatId": "919876543210@c.us",
+  "phone": "919876543210",
+  "body": "Hello from Postman",
+  "type": "text",
+  "status": "read",
+  "fromMe": true,
+  "timestamp": "2026-09-02T20:31:04Z",
+  "source": "api",
+  "createdAt": "...",
+  "updatedAt": "..."
+}
+```
+
+- **`direction`** is `in` or `out`. **`status`** moves `sent → delivered → read` as receipts arrive,
+  or becomes `failed` / `revoked` / `edited`.
+- **Messages you type on the phone itself are captured too**, so the archive is the whole
+  conversation, not just API traffic.
+- `source` is `api` (from `/send`), `poll` (collected from your queue), or `webhook` (seen by the
+  engine — including messages you typed on your own phone).
+- `(sessionName, messageId)` is unique and every write is an upsert, so the `/send` row and the
+  engine's own event for it merge into one document and retries never duplicate.
+- Raw event envelopes go to the `events` collection. Turn that off with `STORE_RAW_EVENTS=false`.
+
+---
+
+## Configuration
+
+`bridge\.env` is generated and matched up already — the gateway key is shared with `repo\.env`, and
+the bridge key and event-signing secret are random values for this install. What you may want to set:
+
+| Setting          | Note                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------- |
+| `MONGO_URI`      | Currently the **local MongoDB service** on this machine, verified working. Change it to archive elsewhere. |
+| `POLL_URL`       | Your queue endpoint. Set — polling is on.                                             |
+| `POLL_TOKEN`     | Bearer token sent with each poll.                                                     |
+| `WEBHOOK_TOKEN`  | **Empty — put your bearer token here.**                                               |
+| `BRIDGE_API_KEY` | The bearer token Postman sends as `Authorization: Bearer <key>`.                       |
+
+Both `.env` files hold secrets — keep them off GitHub (`bridge\.gitignore` covers its own).
+
+---
+
+## Notes on this install
+
+**Dependencies were installed with `npm ci --ignore-scripts`, then `node scripts/postinstall.js`.**
+Necessary, not a shortcut: `better-sqlite3` has no install script, so npm auto-runs `node-gyp
+rebuild`, which demands Visual Studio C++ Build Tools (several GB). The package already ships a
+prebuilt `prebuilds/win32-x64.node` that its loader prefers over anything node-gyp would produce, so
+skipping the build costs nothing. `postinstall.js` then applies the ten upstream
+`whatsapp-web.js`/`baileys` patches a plain `--ignore-scripts` install would have skipped. `start.ps1`
+does both in the right order, and adds Git's `patch.exe` to PATH for the patch step.
+
+**Puppeteer never downloaded its own Chromium** (same reason), so `repo\.env` points
+`PUPPETEER_EXECUTABLE_PATH` at the installed Google Chrome. Update that line if Chrome moves.
+
+**`SSRF_ALLOWED_HOSTS=localhost,127.0.0.1` in `repo\.env` is load-bearing.** The gateway refuses to
+register an event subscription pointing at a loopback address unless it is allowlisted, and the
+bridge listens on loopback. Remove it and events stop arriving.
+
+**Harmless Windows warnings at startup:** `chmod 0o600 failed ... ENOENT` and `Docker not available`.
+Neither affects anything here.
+
+## Keeping it running unattended
+
+Run both as services with [NSSM](https://nssm.cc/) so they survive logout and restart on failure:
+
+```powershell
+nssm install OpenWA "C:\Program Files\nodejs\node.exe" "dist\main"
+nssm set OpenWA AppDirectory "C:\Users\nlabs\Desktop\openwa\repo"
+
+nssm install OpenWABridge "C:\Users\nlabs\Desktop\openwa\bridge\.venv\Scripts\python.exe" "-m app.main"
+nssm set OpenWABridge AppDirectory "C:\Users\nlabs\Desktop\openwa\bridge"
+```
+
+Order does not matter: the bridge retries via `POST /events/register`, and the gateway retries
+deliveries.
+
+## Before you connect a real number
+
+This drives WhatsApp Web through a reverse-engineered client, not Meta's official API. WhatsApp can
+restrict or ban a number for automated use. **Use a dedicated number you can afford to lose**, warm
+it up for a few days before sending in volume, and keep the pace human. `repo\README.md` has
+upstream's full guidance.
+
+## Testing without touching WhatsApp
+
+```powershell
+cd bridge
+.\.venv\Scripts\python.exe scripts\selftest.py
+```
+
+63 checks over auth (both header styles), number parsing, the send path, every event branch, and the poll loop's parsing, dedup
+rules and failure handling — with MongoDB and the gateway stubbed out.
