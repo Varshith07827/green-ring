@@ -50,6 +50,22 @@ if (-not (Test-Path $rootEnv)) {
     if ($pollUrl) { $pollToken = Read-Host "  Bearer token for that URL" }
 
     $bridgeKey = New-Secret 24
+
+    # The gateway key is a SEED, not an override. On its first boot the gateway
+    # copies API_MASTER_KEY into its own database and writes it to
+    # repo\data\.api-key; from then on it authenticates against the database and
+    # ignores the setting entirely. So if that file already exists - a gateway
+    # that ran before this .env did - inventing a fresh key here would hand the
+    # bridge a credential the gateway has never heard of, and every call would
+    # 401. Adopt the key it actually seeded instead.
+    $bootstrapKey = Join-Path $repo "data\.api-key"
+    if (Test-Path $bootstrapKey) {
+        $gatewayKey = (Get-Content $bootstrapKey -Raw).Trim()
+        Write-Host "  Adopting the gateway key it already seeded (repo\data\.api-key)." -ForegroundColor DarkGray
+    }
+    else {
+        $gatewayKey = New-Secret 32
+    }
 @"
 # ===========================================================================
 # Configuration - this is the only file you edit.
@@ -74,7 +90,7 @@ POLL_TOKEN=$pollToken
 BRIDGE_API_KEY=$bridgeKey
 
 # Shared with the WhatsApp gateway. start.ps1 copies it into repo\.env.
-OPENWA_API_KEY=$(New-Secret 32)
+OPENWA_API_KEY=$gatewayKey
 
 # Signs the gateway's internal event deliveries to the bridge.
 EVENTS_SECRET=$(New-Secret 24)
@@ -104,6 +120,31 @@ EVENTS_SECRET=$(New-Secret 24)
 $conf = Read-EnvFile $rootEnv
 $gatewayKey = $conf["OPENWA_API_KEY"]
 if (-not $gatewayKey) { Write-Error "OPENWA_API_KEY is missing from .env" }
+
+# The gateway only ever SEEDS from API_MASTER_KEY, on its very first boot, and
+# authenticates against its database afterwards. Once repo\data\.api-key exists,
+# that file - not .env - is the key the gateway actually accepts. If the two
+# disagree, every call from the bridge 401s, and nothing in the logs says why.
+$bootstrapKey = Join-Path $repo "data\.api-key"
+if (Test-Path $bootstrapKey) {
+    $seeded = (Get-Content $bootstrapKey -Raw).Trim()
+    if ($seeded -and $seeded -ne $gatewayKey) {
+        Write-Host ""
+        Write-Warning "OPENWA_API_KEY in .env is not the key this gateway accepts."
+        Write-Host "  .env has                : $($gatewayKey.Substring(0, [Math]::Min(12, $gatewayKey.Length)))..." -ForegroundColor DarkGray
+        Write-Host "  the gateway seeded      : $($seeded.Substring(0, [Math]::Min(12, $seeded.Length)))..." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  The gateway takes API_MASTER_KEY only on its FIRST boot, then uses its own" -ForegroundColor DarkGray
+        Write-Host "  database. Yours has already booted, so .env is being ignored." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Fix it by putting the seeded key in .env:" -ForegroundColor Cyan
+        Write-Host "    OPENWA_API_KEY=$seeded" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Or, to start the gateway over from scratch, delete repo\data - which also" -ForegroundColor DarkGray
+        Write-Host "  unpairs WhatsApp and means scanning the QR again." -ForegroundColor DarkGray
+        Write-Error "Refusing to start with a key the gateway will reject."
+    }
+}
 
 # Chrome is required: dependencies install without Puppeteer's own copy.
 $chrome = @(
