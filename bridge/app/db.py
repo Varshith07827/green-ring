@@ -79,6 +79,13 @@ class Store:
         await self.messages.create_index(
             [("direction", ASCENDING), ("timestamp", DESCENDING)], name="by_direction"
         )
+        # Look a person up by number, or find everything that has a file.
+        await self.messages.create_index(
+            [("contactNumber", ASCENDING), ("timestamp", DESCENDING)], name="by_contact"
+        )
+        await self.messages.create_index(
+            [("media.path", ASCENDING)], name="by_media", sparse=True
+        )
         await self.events.create_index([("receivedAt", DESCENDING)], name="by_received")
         await self.events.create_index(
             [("idempotencyKey", ASCENDING)], name="uniq_idempotency", unique=True, sparse=True
@@ -139,6 +146,31 @@ class Store:
     async def get_message(self, *, session_name: str, message_id: str) -> dict[str, Any] | None:
         return await self.messages.find_one(
             {"sessionName": session_name, "messageId": message_id}
+        )
+
+    async def claim_media(self, *, session_name: str, message_id: str) -> bool:
+        """Take ownership of downloading this message's media, exactly once.
+
+        Same atomic-update guard as the poll claim: the gateway redelivers an
+        event it thinks failed, and without this the same photo would be fetched
+        and written two or three times.
+        """
+        result = await self.messages.update_one(
+            {
+                "sessionName": session_name,
+                "messageId": message_id,
+                "mediaClaimedAt": {"$exists": False},
+            },
+            {"$set": {"mediaClaimedAt": utcnow()}},
+        )
+        return result.modified_count == 1
+
+    async def record_media(
+        self, *, session_name: str, message_id: str, media: dict[str, Any]
+    ) -> None:
+        await self.messages.update_one(
+            {"sessionName": session_name, "messageId": message_id},
+            {"$set": {"media": media, "updatedAt": utcnow()}},
         )
 
     async def claim_polled(self, *, session_name: str, poll_message_id: str) -> bool:

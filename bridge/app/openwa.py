@@ -1,7 +1,9 @@
 """Thin async client for the local OpenWA gateway."""
 
 import logging
+import re
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 
@@ -129,6 +131,40 @@ class OpenWAClient:
                     json=payload,
                 )
             raise
+
+    async def download_media(self, chat_id: str, message_id: str) -> tuple[bytes, str, str | None]:
+        """Fetch a message's media bytes.
+
+        Returns (content, mimetype, filename). The gateway serves its archived
+        copy first and falls back to the inline copy on the message row, so this
+        works for inbound media whether or not archiving is switched on.
+
+        A `404` here is normal rather than exceptional: the message may carry no
+        media, the bytes may have exceeded the gateway's size cap when it was
+        stored, or it may have been a URL-based send, which stores nothing.
+        """
+        session_id = await self.session_id()
+        path = f"/api/sessions/{session_id}/messages/{chat_id}/{message_id}/media"
+        try:
+            response = await self._client.get(path)
+        except httpx.RequestError as exc:
+            raise OpenWAError(f"cannot reach OpenWA at {self.base_url}: {exc}") from exc
+
+        if response.status_code >= 400:
+            detail = response.text[:200]
+            raise OpenWAError(
+                f"media download failed with {response.status_code}: {detail}",
+                status=response.status_code,
+            )
+
+        mimetype = response.headers.get("content-type", "application/octet-stream")
+        filename = None
+        disposition = response.headers.get("content-disposition", "")
+        match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disposition)
+        if match:
+            filename = unquote(match.group(1)).strip() or None
+
+        return response.content, mimetype, filename
 
     # -- webhooks -----------------------------------------------------------
 

@@ -60,6 +60,19 @@ class Settings(BaseSettings):
     poll_interval: float = 3.0
     poll_timeout: float = 15.0
 
+    # --- Media ---------------------------------------------------------------
+    # Photos, voice notes, documents and video are not in the webhook - only a
+    # `hasMedia` flag. When this is on, the bridge fetches the bytes from the
+    # gateway, writes them under media_dir, and records the path on the message.
+    media_enabled: bool = True
+    media_dir: str = "data/media"
+    # Skip anything larger. The gateway has its own cap (50 MiB by default);
+    # this one bounds what lands on your disk.
+    media_max_bytes: int = 25 * 1024 * 1024
+    # Media you send is fetchable too, but doubles the storage for a copy you
+    # already have. Off by default.
+    media_outbound: bool = False
+
     # --- Event ingress (OpenWA -> bridge) -----------------------------------
     # Internal plumbing on loopback. Nothing here is your endpoint.
     events_path: str = "/webhooks/openwa"
@@ -111,6 +124,12 @@ class Settings(BaseSettings):
     @property
     def poll_bearer(self) -> str:
         return self.poll_token.strip()
+
+    @property
+    def media_root(self) -> Path:
+        """Where media files land, resolved against the project root."""
+        candidate = Path(self.media_dir)
+        return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
 
     def startup_problems(self) -> list[str]:
         """Configuration errors that should stop the process at boot."""

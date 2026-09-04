@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from . import media
 from . import messages as msg_map
 from . import poller
 from .config import get_settings
@@ -47,6 +48,11 @@ openwa = OpenWAClient(
     settings.openwa_timeout,
 )
 poll_client = poller.PollClient(settings.poll_bearer, settings.poll_timeout)
+
+# Media downloads run detached from the delivery that triggered them, so the
+# gateway is not kept waiting on a video. asyncio only holds weak references to
+# tasks, and one that gets collected mid-flight simply vanishes.
+_background: set[asyncio.Task] = set()
 
 
 @asynccontextmanager
@@ -100,6 +106,11 @@ async def lifespan(app: FastAPI):
                 await poll_task
             except asyncio.CancelledError:
                 pass
+        # Let media downloads in flight finish writing rather than leaving a
+        # half-written file on disk with a path already recorded in MongoDB.
+        if _background:
+            log.info("waiting for %d media download(s) to finish", len(_background))
+            await asyncio.wait(set(_background), timeout=30)
         await poll_client.close()
         await openwa.close()
         await store.close()
@@ -260,6 +271,74 @@ async def _send_and_store(
         on_insert={"status": "sent", "timestamp": sent_at},
     )
     return message_id
+
+
+# ----------------------------------------------------------------- media ---
+
+
+async def _save_media(message_id: str, chat_id: str, phone: str | None) -> None:
+    """Fetch one message's media and record where it was written.
+
+    Detached from the delivery that triggered it, so the gateway gets its 200
+    immediately rather than waiting on a video download. Every failure is
+    recorded on the message: a photo that could not be fetched should say so on
+    the row, not only in a log line nobody reads.
+    """
+    session_name = settings.openwa_session_name
+    try:
+        content, mimetype, filename = await openwa.download_media(chat_id, message_id)
+    except OpenWAError as exc:
+        # 404 is routine - no stored media, over the gateway's size cap, or a
+        # URL-based send, which stores nothing.
+        level = log.info if exc.status == 404 else log.warning
+        level("media: nothing to fetch for %s (%s)", message_id, exc)
+        await store.record_media(
+            session_name=session_name,
+            message_id=message_id,
+            media={"error": str(exc), "savedAt": utcnow()},
+        )
+        return
+
+    if len(content) > settings.media_max_bytes:
+        log.warning(
+            "media: %s is %d bytes, over the %d limit - not saved",
+            message_id,
+            len(content),
+            settings.media_max_bytes,
+        )
+        await store.record_media(
+            session_name=session_name,
+            message_id=message_id,
+            media={
+                "error": f"{len(content)} bytes exceeds MEDIA_MAX_BYTES ({settings.media_max_bytes})",
+                "sizeBytes": len(content),
+                "mimetype": mimetype,
+                "savedAt": utcnow(),
+            },
+        )
+        return
+
+    root = settings.media_root
+    saved = await asyncio.to_thread(
+        media.save,
+        root,
+        content,
+        phone=phone,
+        message_id=message_id,
+        mimetype=mimetype,
+        filename=filename,
+    )
+    await store.record_media(
+        session_name=session_name, message_id=message_id, media=saved.as_document(root)
+    )
+    log.info("media saved: %s (%s, %d bytes)", saved.path, saved.mimetype, saved.size_bytes)
+
+
+def _spawn(coro) -> None:
+    """Run detached, keeping a strong reference so it is not collected."""
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 # ------------------------------------------------------------------ poll ---
@@ -437,6 +516,19 @@ async def openwa_webhook(request: Request) -> dict[str, Any]:
             on_insert={"status": "received" if event == msg_map.INBOUND_EVENT else "sent"},
         )
         log.info("%s %s %s", event, fields.get("chatId"), (fields.get("body") or "")[:60])
+
+        # Media arrives as a flag, not bytes. Fetch it once - the claim is
+        # atomic, so a redelivered event does not download it again.
+        wanted = event == msg_map.INBOUND_EVENT or settings.media_outbound
+        if (
+            settings.media_enabled
+            and wanted
+            and fields.get("hasMedia")
+            and message_id
+            and fields.get("chatId")
+            and await store.claim_media(session_name=session_name, message_id=message_id)
+        ):
+            _spawn(_save_media(message_id, fields["chatId"], fields.get("contactNumber")))
 
     elif event in ("message.ack", "message.failed"):
         message_id, status = msg_map.ack_fields(data)

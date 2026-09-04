@@ -39,13 +39,12 @@ cd green-ring
 ```
 
 That's the whole thing. The first run asks three questions — your MongoDB URI, the queue URL to poll
-(blank to skip), and its bearer token — then writes both `.env` files, installs dependencies, builds,
-and starts the two processes. It prints your `BRIDGE_API_KEY`; that's the token Postman sends.
+(blank to skip), and its bearer token — then writes `.env`, installs dependencies, builds, and
+starts the two processes. It prints your `BRIDGE_API_KEY`; that's the token Postman sends.
 
-The `.env` files are deliberately **not** in the repo, since they hold secrets. They also share one:
-the bridge authenticates to the gateway with the key the gateway is configured to accept. `start.ps1`
-generates both together, which is what keeps that pair in step — setting them by hand is where a
-fresh install usually goes wrong.
+`.env` is deliberately **not** in the repo, since it holds secrets. The gateway's own `repo\.env` is
+**generated from it** on every run, which is what keeps the key those two processes share in step —
+setting it by hand is where a fresh install usually goes wrong.
 
 **Then, once:** open <http://localhost:2785>, start the `default` session and scan the QR from
 WhatsApp → Settings → Linked devices → Link a device. The session already exists — the bridge creates
@@ -75,7 +74,7 @@ and `POLL_TOKEN` pointing at it.
 
 ```
 POST http://localhost:8000/send
-Authorization: Bearer <BRIDGE_API_KEY from bridge\.env>
+Authorization: Bearer <BRIDGE_API_KEY from .env>
 Content-Type: application/json
 
 { "id": "919876543210", "msg": "Hello from Postman" }
@@ -100,7 +99,7 @@ immediately.
 (`120363...@g.us`) passes through untouched, so the same endpoint sends to groups.
 
 A number with no country code is **rejected**, so a message cannot silently go to the wrong country.
-Set `DEFAULT_COUNTRY_CODE=91` in `bridge\.env` to accept bare national numbers instead.
+Set `DEFAULT_COUNTRY_CODE=91` in `.env` to accept bare national numbers instead.
 
 **`msg`** is text, 1–4096 characters. `number`/`to`/`phone` and `message`/`text`/`body` are accepted
 as aliases.
@@ -137,7 +136,7 @@ and nothing routable about this desktop.
                                            forgets the message
 ```
 
-Set `POLL_URL` in `bridge\.env` and it starts. One URL, two verbs: `POST` queues a message, `GET`
+Set `POLL_URL` in `.env` and it starts. One URL, two verbs: `POST` queues a message, `GET`
 asks "anything waiting to go out?".
 
 What a poll response may return:
@@ -261,6 +260,29 @@ Database `openwa`, collection `messages`. One document per WhatsApp message, bot
   conversation, not just API traffic.
 - `source` is `api` (from `/send`), `poll` (collected from your queue), or `webhook` (seen by the
   engine — including messages you typed on your own phone).
+- **`contactName` and `contactNumber`** are the other party, pulled out as top-level fields so you
+  can query and index them. The name prefers your saved contact name over `pushName`, which is
+  whatever they call themselves this week. The number falls back through the contact record, the
+  gateway's `senderPhone` (for privacy-id `@lid` senders), then the chat id — and is `null` for a
+  group, which has no single number.
+- **`media`** is present on any message that carried a file:
+
+```json
+"media": {
+  "path": "2026/09/04/917981149423_3EB0ABCD_4a1ac396a5.jpg",
+  "absolutePath": "C:\Users\nlabs\Desktop\openwa\data\media\2026\09\04\...",
+  "filename": "photo.jpg",
+  "mimetype": "image/jpeg",
+  "sizeBytes": 184203,
+  "savedAt": "2026-09-04T00:31:00Z"
+}
+```
+
+  Photos, voice notes, video and documents are fetched from the gateway and written under
+  `data/media/`, laid out by date so no directory grows unmanageable. `path` is relative, so the
+  archive survives the project moving; `absolutePath` is for opening it now. If a download fails the
+  field holds `{"error": …}` instead — a file that could not be fetched says so on the row rather
+  than only in a log.
 - `(sessionName, messageId)` is unique and every write is an upsert, so the `/send` row and the
   engine's own event for it merge into one document and retries never duplicate.
 - Raw event envelopes go to the `events` collection. Turn that off with `STORE_RAW_EVENTS=false`.
@@ -269,16 +291,22 @@ Database `openwa`, collection `messages`. One document per WhatsApp message, bot
 
 ## Configuration
 
-`bridge\.env` is generated and matched up already — the gateway key is shared with `repo\.env`, and
-the bridge key and event-signing secret are random values for this install. What you may want to set:
+One file, `.env` at the root, holding the six settings that have no usable default. Everything else
+falls back to a working default and only belongs in the file if you are changing it — `.env.example`
+lists the full set, commented.
 
 | Setting          | Note                                                                                  |
 | ---------------- | ------------------------------------------------------------------------------------- |
 | `MONGO_URI`      | Currently the **local MongoDB service** on this machine, verified working. Change it to archive elsewhere. |
 | `POLL_URL`       | Your queue endpoint. Set to the deployed Worker — polling is on.                       |
 | `POLL_TOKEN`     | Bearer token sent with each poll. Matches the Worker's `API_TOKEN` secret.             |
-| `POLL_INTERVAL`  | Seconds between polls (3). Raise it if your endpoint is on shared hosting.             |
 | `BRIDGE_API_KEY` | The bearer token Postman sends as `Authorization: Bearer <key>`.                       |
+| `OPENWA_API_KEY` | Shared with the gateway. Adopted from `repo\data\.api-key` when the gateway has already seeded one. |
+| `EVENTS_SECRET`  | Signs the gateway's internal event deliveries.                                         |
+
+Useful optional ones: `POLL_INTERVAL` (3s — raise it if your endpoint is on shared hosting),
+`MEDIA_ENABLED`, `MEDIA_DIR`, `MEDIA_MAX_BYTES` (25 MiB), `MEDIA_OUTBOUND` (off — your own sent
+media is a copy you already have), and `DEFAULT_COUNTRY_CODE`.
 
 Both `.env` files hold secrets — keep them off GitHub (`bridge\.gitignore` covers its own).
 
@@ -333,6 +361,6 @@ cd bridge
 .\.venv\Scripts\python.exe scripts\selftest.py
 ```
 
-65 checks over auth (both header styles), number parsing, the send path, every event branch, and the
-poll loop's parsing, dedup rules, refusals and failure handling — with MongoDB and the gateway
-stubbed out.
+89 checks over auth (both header styles), number parsing, the send path, every event branch, and the
+poll loop's parsing, dedup rules, refusals and failure handling, plus contact resolution and media
+filenames — with MongoDB and the gateway stubbed out.

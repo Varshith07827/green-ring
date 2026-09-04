@@ -171,6 +171,16 @@ PUPPETEER_HEADLESS=true
 PUPPETEER_ARGS=--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage
 PUPPETEER_EXECUTABLE_PATH=$chrome
 
+# Send the full contact record on inbound messages - id, number, shortName,
+# business flags - instead of just { name, pushName }. It is read from the
+# already-cached contact, so it costs no extra WhatsApp lookups.
+WEBHOOK_CONTACT_DETAILS=true
+# Attach `senderPhone` when a sender is identified by a privacy id (@lid)
+# rather than a number, so a real number can still be recorded.
+RESOLVE_LID_TO_PHONE=true
+# Keep a durable copy of inbound media, so it survives past the inline copy.
+CHAT_MEDIA_ARCHIVE_ENABLED=true
+
 WEBHOOK_TIMEOUT=10000
 WEBHOOK_RETRY_DELAY=5000
 WEBHOOK_SHUTDOWN_DRAIN_MS=15000

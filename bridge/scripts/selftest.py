@@ -79,6 +79,18 @@ class FakeStore:
     async def get_message(self, *, session_name, message_id):
         return self.docs.get((session_name, message_id))
 
+    async def claim_media(self, *, session_name, message_id):
+        doc = self.docs.get((session_name, message_id))
+        if doc is None or "mediaClaimedAt" in doc:
+            return False
+        doc["mediaClaimedAt"] = True
+        return True
+
+    async def record_media(self, *, session_name, message_id, media):
+        doc = self.docs.get((session_name, message_id))
+        if doc is not None:
+            doc["media"] = media
+
     async def claim_polled(self, *, session_name, poll_message_id):
         key = f"{session_name}:{poll_message_id}"
         if key in self.poll_claims:
@@ -310,6 +322,102 @@ async def run() -> int:
         check("message sent from the phone is captured", phone_doc is not None)
         check("its direction is out", (phone_doc or {}).get("direction") == "out")
         check("its chat id is the recipient", (phone_doc or {}).get("chatId") == "919876543210@c.us")
+
+        print("\n-- contact name and number --")
+        from app import media as media_mod  # noqa: PLC0415
+        from app import messages as msg_mod  # noqa: PLC0415
+
+        rich = {
+            "from": "917981149423@c.us",
+            "to": "918985370703@c.us",
+            "contact": {"name": "Alice Kumar", "pushName": "alice", "number": "+91 79811 49423"},
+        }
+        fields = msg_mod.message_fields("message.received", rich)
+        check("saved contact name wins over pushName", fields["contactName"] == "Alice Kumar", str(fields["contactName"]))
+        check(
+            "contact number is normalised to digits",
+            fields["contactNumber"] == "917981149423",
+            str(fields["contactNumber"]),
+        )
+
+        push_only = {"from": "917981149423@c.us", "contact": {"pushName": "Bob"}}
+        f2 = msg_mod.message_fields("message.received", push_only)
+        check("falls back to pushName", f2["contactName"] == "Bob", str(f2["contactName"]))
+        check(
+            "falls back to the chat id for the number",
+            f2["contactNumber"] == "917981149423",
+            str(f2["contactNumber"]),
+        )
+
+        lid = {"from": "216298915164281@lid", "senderPhone": "917981149423", "contact": {}}
+        f3 = msg_mod.message_fields("message.received", lid)
+        check(
+            "an @lid sender still yields a number via senderPhone",
+            f3["contactNumber"] == "917981149423",
+            str(f3["contactNumber"]),
+        )
+
+        group = {"from": "120363012345678901@g.us", "isGroup": True, "contact": {}}
+        f4 = msg_mod.message_fields("message.received", group)
+        check("a group has no contact number", f4["contactNumber"] is None, str(f4["contactNumber"]))
+        check("no contact means no name, not a guess", f4["contactName"] is None, str(f4["contactName"]))
+
+        print("\n-- media filenames --")
+        check("jpeg gets .jpg, not .jpe", media_mod.extension_for("image/jpeg", None) == ".jpg")
+        check("ogg voice note gets .ogg", media_mod.extension_for("audio/ogg; codecs=opus", None) == ".ogg")
+        check("pdf gets .pdf", media_mod.extension_for("application/pdf", None) == ".pdf")
+        check("unknown type falls back to .bin", media_mod.extension_for("application/x-weird", None) == ".bin")
+        check(
+            "the sender's own filename wins",
+            media_mod.extension_for("application/octet-stream", "quarterly report.XLSX") == ".xlsx",
+        )
+
+        # A raw WhatsApp id contains @ : and . - all illegal or awkward in a
+        # Windows filename.
+        stem = media_mod.safe_stem("917981149423", "true_917981149423@c.us_3EB0FCB1149F877297175B")
+        check("the stem is filename-safe", media_mod.UNSAFE.search(stem) is None, stem)
+        check("it keeps the number and the unique tail", stem.startswith("917981149423_"), stem)
+        check(
+            "two messages in one chat get different names",
+            media_mod.safe_stem("91", "true_x_AAAA") != media_mod.safe_stem("91", "true_x_BBBB"),
+        )
+        # Real outbound ids end in a literal "_out", so anything derived from
+        # the last underscore-separated segment collides for every one of them.
+        out_a = media_mod.safe_stem("918985370703", "true_259094657142792@lid_3EB051DEB650C17ECF2511_out")
+        out_b = media_mod.safe_stem("918985370703", "true_259094657142792@lid_3EB0AAAAAAAAAAAAAAAAAA_out")
+        check("two outbound media files do not collide", out_a != out_b, f"{out_a} vs {out_b}")
+        check("outbound stem is not just the _out suffix", not out_a.endswith("_out"), out_a)
+        check(
+            "a group with no number still gets a name",
+            media_mod.safe_stem(None, "false_120363@g.us_ZZZ").startswith("chat_"),
+            media_mod.safe_stem(None, "false_120363@g.us_ZZZ"),
+        )
+
+        import tempfile  # noqa: PLC0415
+        from datetime import datetime as _dt  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved = media_mod.save(
+                root,
+                b"\xff\xd8\xff-not-really-a-jpeg",
+                phone="917981149423",
+                message_id="true_917981149423@c.us_3EB0ABCD",
+                mimetype="image/jpeg",
+                filename=None,
+                when=_dt(2026, 9, 4, tzinfo=timezone.utc),
+            )
+            check("file is written to disk", (root / saved.path).is_file(), saved.path)
+            check("laid out by date", saved.path.startswith("2026/09/04/"), saved.path)
+            check("path uses forward slashes", "\\" not in saved.path, saved.path)
+            check(
+                "size recorded",
+                saved.size_bytes == len(b"\xff\xd8\xff-not-really-a-jpeg"),
+                str(saved.size_bytes),
+            )
+            doc = saved.as_document(root)
+            check("document carries a relative and an absolute path", bool(doc["path"]) and bool(doc["absolutePath"]))
+            check("mimetype has no codec suffix", doc["mimetype"] == "image/jpeg", doc["mimetype"])
 
         print("\n-- poll parsing --")
         from app import poller as poll_mod  # noqa: PLC0415
