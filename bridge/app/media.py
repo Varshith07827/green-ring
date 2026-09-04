@@ -139,6 +139,65 @@ def parse_media_ref(value: str) -> MediaRef:
     return MediaRef(data_base64=raw)
 
 
+# Leading bytes that identify a format. A filename and a caller-supplied
+# mimetype are both claims; these are evidence. Ordered longest-first where
+# prefixes overlap so the more specific signature wins.
+SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"%PDF-", "application/pdf"),
+    (b"OggS", "audio/ogg"),
+    (b"ID3", "audio/mpeg"),
+    (b"\x1a\x45\xdf\xa3", "video/webm"),
+    (b"PK\x03\x04", "application/zip"),
+    (b"BM", "image/bmp"),
+)
+
+# Signatures that need a second marker further into the file.
+CONTAINERS: tuple[tuple[bytes, int, bytes, str], ...] = (
+    (b"RIFF", 8, b"WEBP", "image/webp"),
+    (b"RIFF", 8, b"WAVE", "audio/wav"),
+    (b"RIFF", 8, b"AVI ", "video/x-msvideo"),
+)
+
+HTML_MARKERS = (b"<!doctype html", b"<html", b"<?xml", b"<!--")
+
+
+def sniff(content: bytes) -> str | None:
+    """The mimetype the bytes actually are, or None when nothing is recognised.
+
+    This exists because of how badly the alternative fails. `curl -o photo.jpg`
+    against a URL that answers 400 writes the error page to photo.jpg, and every
+    later step believes the extension: the bridge sends it as an image, the
+    engine hands WhatsApp an HTML document, and the reply is a 500 that mentions
+    none of it. Bytes are the only part of that chain that cannot lie.
+    """
+    if not content:
+        return None
+
+    head = content[:32]
+    for magic, mimetype in SIGNATURES:
+        if head.startswith(magic):
+            return mimetype
+    for magic, offset, marker, mimetype in CONTAINERS:
+        if head.startswith(magic) and content[offset : offset + len(marker)] == marker:
+            return mimetype
+    # ISO base media (mp4, m4a, mov): a size field, then 'ftyp'.
+    if content[4:8] == b"ftyp":
+        brand = content[8:12]
+        return "audio/mp4" if brand.startswith(b"M4A") else "video/mp4"
+    # MPEG audio frame sync, for an mp3 with no ID3 tag.
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"
+
+    stripped = content[:512].lstrip().lower()
+    if any(stripped.startswith(marker) for marker in HTML_MARKERS):
+        return "text/html"
+    return None
+
+
 def kind_for(mimetype: str | None, filename: str | None = None) -> str:
     base = (mimetype or "").split(";")[0].strip().lower()
     if not base and filename:

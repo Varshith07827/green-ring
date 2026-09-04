@@ -124,6 +124,7 @@ class FakeOpenWA:
         self.sent: list[tuple[str, str]] = []
         self.media_sent: list[dict[str, Any]] = []
         self.fail_next = False
+        self.fail_status = 400
         self.counter = 0
 
     async def close(self) -> None:
@@ -160,7 +161,7 @@ class FakeOpenWA:
     ):
         if self.fail_next:
             self.fail_next = False
-            raise OpenWAError("session is not active", status=400)
+            raise OpenWAError("Internal server error", status=self.fail_status)
         self.counter += 1
         self.media_sent.append(
             {
@@ -674,6 +675,89 @@ async def run() -> int:
             "the failed media send is recorded",
             any(d.get("status") == "failed" and d.get("type") == "image" for d in store.inserts),
         )
+
+        print("\n-- bytes over labels --")
+
+        openwa.media_sent.clear()
+
+        r = await client.post(
+            "/send",
+            data={"id": "919876543210"},
+            files={"file": ("photo.jpg", b"<!DOCTYPE html><html>400 Bad Request</html>", "image/jpeg")},
+            headers=key_header,
+        )
+        check("html named .jpg is refused", r.status_code == 400, f"got {r.status_code}")
+        check("the refusal says it is HTML", "HTML" in r.text, r.text[:140])
+        check("nothing was sent", not openwa.media_sent, str(openwa.media_sent))
+
+        # An honest HTML file as a document is fine - only media types are refused.
+        r = await client.post(
+            "/send",
+            data={"id": "919876543210", "type": "document"},
+            files={"file": ("page.html", b"<html><body>a real page</body></html>", "text/html")},
+            headers=key_header,
+        )
+        check("html as a document is allowed", r.status_code == 200, f"got {r.status_code}")
+
+        # The bytes win over a wrong extension when the caller did not insist.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+        r = await client.post(
+            "/send",
+            data={"id": "919876543210"},
+            files={"file": ("mystery.txt", png, "text/plain")},
+            headers=key_header,
+        )
+        check("a mislabelled png is corrected", r.status_code == 200, f"got {r.status_code}")
+        check("corrected to image/png", openwa.media_sent[-1]["mimetype"] == "image/png", str(openwa.media_sent[-1]["mimetype"]))
+        check("and sent as an image", openwa.media_sent[-1]["kind"] == "image", openwa.media_sent[-1]["kind"])
+
+        # An explicit mimetype is respected even when the bytes disagree.
+        r = await client.post(
+            "/send",
+            data={"id": "919876543210", "mimetype": "application/octet-stream"},
+            files={"file": ("thing.bin", png, "application/octet-stream")},
+            headers=key_header,
+        )
+        check(
+            "an explicit mimetype is not overridden",
+            openwa.media_sent[-1]["mimetype"] == "application/octet-stream",
+            str(openwa.media_sent[-1]["mimetype"]),
+        )
+
+        print("\n-- explained failures --")
+
+        openwa.fail_next = True
+        openwa.fail_status = 500
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://blocked.example/photo.jpg"},
+            headers=key_header,
+        )
+        check("a gateway 500 becomes a 502", r.status_code == 502, f"got {r.status_code}")
+        check("the failing url is named", "blocked.example" in r.text, r.text[:200])
+        check("and it suggests checking the url", "curl" in r.text, r.text[:200])
+
+        openwa.fail_next = True
+        openwa.fail_status = 500
+        r = await client.post(
+            "/send",
+            data={"id": "919876543210"},
+            files={"file": ("clip.mp4", b"\x00\x00\x00\x20ftypisom", "video/mp4")},
+            headers=key_header,
+        )
+        check("a bytes send explains itself too", r.status_code == 502, f"got {r.status_code}")
+        check("naming the type it refused", "video" in r.text, r.text[:200])
+        check("without mentioning a url", "curl -sSI" not in r.text, r.text[:200])
+
+        openwa.fail_next = True
+        openwa.fail_status = 400
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://ex.com/a.jpg"},
+            headers=key_header,
+        )
+        check("a 4xx is passed through unchanged", r.status_code == 400, f"got {r.status_code}")
+        openwa.fail_status = 400
 
         print("\n-- forms and numbers --")
 

@@ -373,6 +373,33 @@ async def _send_text(chat_id: str, text: str) -> SendResponse:
     )
 
 
+def _explain_media_failure(
+    exc: OpenWAError, ref: "media.MediaRef", mimetype: str | None, kind: str
+) -> OpenWAError:
+    """Add the likely cause to a gateway 5xx on a media send.
+
+    "failed with 500: Internal server error" is what the gateway says whether the
+    URL it was asked to fetch answered 403, the bytes were not really an image,
+    or something genuinely broke inside it. The three need different fixes and
+    the message distinguishes none of them, so name the two we can infer.
+    """
+    if not exc.status or exc.status < 500:
+        return exc
+    if ref.url:
+        hint = (
+            f"the gateway could not send {ref.url} as {kind}. It fetches the URL itself, and many "
+            "hosts refuse a server-side request (403/400) or serve something that is not media - "
+            f"check with: curl -sSI '{ref.url}'. Upstream: {exc}"
+        )
+    else:
+        hint = (
+            f"the gateway refused these bytes as {kind} ({mimetype}). Usually the file is not what "
+            f"it claims to be, or the format is one WhatsApp will not accept for {kind}. "
+            f"Upstream: {exc}"
+        )
+    return OpenWAError(hint, status=exc.status, body=exc.body)
+
+
 async def _send_media(
     chat_id: str,
     payload: SendRequest,
@@ -404,6 +431,30 @@ async def _send_media(
     kind, ptt = _kind_and_ptt(payload.type, mimetype, filename)
     caption = payload.msg or None
 
+    # A filename and a declared mimetype are both claims about the bytes. When we
+    # hold the bytes we can check, and it is worth checking: `curl -o photo.jpg`
+    # against a URL that answers 400 writes the error page to photo.jpg, and
+    # every step after that believes the name.
+    if content is not None:
+        detected = media.sniff(content)
+        if detected:
+            if detected == "text/html" and kind in ("image", "video", "audio", "sticker"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"that file is HTML, not {kind} - it looks like a web page or an error "
+                        "response saved under a media filename. Check what actually downloaded "
+                        "(`file <name>` will say), then send the real file."
+                    ),
+                )
+            declared = (mimetype or "").split(";")[0].strip().lower()
+            if detected != declared and not payload.mimetype:
+                # The caller did not insist on a type, so believe the bytes.
+                log.info("media: sent as %s, bytes say %s - using the bytes", declared, detected)
+                mimetype = detected
+                if not payload.type:
+                    kind, ptt = _kind_and_ptt(None, mimetype, filename)
+
     # Bytes we hold travel base64-encoded, which inflates them by a third. Check
     # the encoded length against the gateway's body cap here, where the limit can
     # be named, rather than letting it answer with a bare 413 that says nothing
@@ -434,7 +485,7 @@ async def _send_media(
         )
     except OpenWAError as exc:
         await _record_failure(chat_id, body=caption or "", kind=kind, error=exc, when=sent_at)
-        raise
+        raise _explain_media_failure(exc, ref, mimetype, kind) from exc
 
     message_id = (result or {}).get("messageId")
     doc = await store.upsert_message(

@@ -193,6 +193,20 @@ from instead.
 Uploads are capped near 24 MiB, measured *after* base64 encoding, which is what the gateway's
 25 MB body limit actually sees. Past that, host the file and send its URL.
 
+**The bytes outrank the filename.** An uploaded file is checked against its own magic bytes, because
+a name is a claim and the content is not. Two things follow:
+
+- A file that is really HTML, sent as an image, video or audio, is **refused with a 400** that says
+  so. This is the `curl -o photo.jpg` case — the URL answered 400, curl wrote the error page under
+  the name you asked for, and everything downstream believed the extension.
+- A file whose extension is simply wrong is **corrected**: a PNG called `mystery.txt` is sent as an
+  image. Set `mimetype` explicitly and that is respected instead.
+
+When the gateway does fail a media send, the bridge names the likely cause rather than passing on
+`500: Internal server error`. A URL send says which URL and suggests checking it — many hosts refuse
+server-side requests, which is the single most common surprise with `media` — and a byte send names
+the type it was refused as.
+
 | Method | Path               | Auth  | Purpose                                                     |
 | ------ | ------------------ | ----- | ----------------------------------------------------------- |
 | `POST` | `/send`            | token | Send text or a file to any chat, by `id`                    |
@@ -367,7 +381,7 @@ bridge/.venv/bin/python bridge/scripts/selftest.py        # Linux
 bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py
 ```
 
-**111 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
+**126 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
 running: auth on both header styles, number parsing, the send path, every event branch, media
-detection and filenames, contact resolution, media sending by URL and by upload, and number
-normalisation.
+detection and filenames, contact resolution, media sending by URL and by upload, byte sniffing,
+and number normalisation.
