@@ -373,6 +373,24 @@ fi
 # --------------------------------------------------------------------------
 
 step "Starting"
+
+# A leftover gateway or bridge from an earlier run still owns its port, and the
+# copy started here would exit with EADDRINUSE seconds later - after this script
+# had already printed "Running" and a set of instructions that cannot work.
+BRIDGE_PORT="$(get_env BRIDGE_PORT)"
+BRIDGE_PORT="${BRIDGE_PORT:-8000}"
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+for p in 2785 "$BRIDGE_PORT"; do
+  if port_busy "$p"; then
+    warn "port $p is already in use - something from an earlier run is still going."
+    say "  see what:  sudo ss -lntp | grep :$p"
+    say "  stop it:   sudo fuser -k $p/tcp"
+    say "  or, if it was installed as a service:"
+    say "             sudo systemctl stop openwa-gateway openwa-bridge"
+    die "Refusing to start a second copy on port $p."
+  fi
+done
+
 cd "$REPO"
 node dist/main &
 GATEWAY_PID=$!
@@ -402,6 +420,16 @@ BRIDGE_PID=$!
 cd "$ROOT"
 
 sleep 3
+
+# Never announce success for a process that has already died. Both of these can
+# exit during startup - the gateway on a port clash, the bridge when MongoDB
+# refuses it - and printing "Running" over the top of that error sends people
+# looking in the wrong place.
+kill -0 "$GATEWAY_PID" 2>/dev/null || die "the gateway exited during startup - its error is above."
+kill -0 "$BRIDGE_PID"  2>/dev/null || die "the bridge exited during startup - its error is above.
+  A MongoDB 'requires authentication' there means MONGO_URI in .env needs a
+  username and password, e.g. mongodb://user:pass@localhost:27017/?authSource=admin"
+
 HOSTNAME_GUESS="$(hostname -I 2>/dev/null | awk '{print $1}')"
 HOSTNAME_GUESS="${HOSTNAME_GUESS:-localhost}"
 
