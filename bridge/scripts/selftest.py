@@ -79,6 +79,13 @@ class FakeStore:
     async def get_message(self, *, session_name, message_id):
         return self.docs.get((session_name, message_id))
 
+    async def set_fields(self, *, session_name, message_id, fields):
+        doc = self.docs.get((session_name, message_id))
+        if doc is None:
+            return False
+        doc.update({k: v for k, v in fields.items() if v is not None})
+        return True
+
     async def claim_media(self, *, session_name, message_id):
         doc = self.docs.get((session_name, message_id))
         if doc is None or "mediaClaimedAt" in doc:
@@ -361,6 +368,93 @@ async def run() -> int:
         f4 = msg_mod.message_fields("message.received", group)
         check("a group has no contact number", f4["contactNumber"] is None, str(f4["contactNumber"]))
         check("no contact means no name, not a guess", f4["contactName"] is None, str(f4["contactName"]))
+
+        print("\n-- media detection --")
+        # The real payload shape: no hasMedia flag anywhere, a `media` object
+        # with the file inlined as base64.
+        real = {
+            "id": "true_259094657142792@lid_AC044B45_out",
+            "from": "918985370703@c.us",
+            "chatId": "259094657142792@lid",
+            "type": "image",
+            "media": {"mimetype": "image/jpeg", "data": "aGVsbG8=", "filename": "photo.jpg"},
+        }
+        mf = msg_mod.message_fields("message.sent", real)
+        check("a media message is detected without a hasMedia flag", mf["hasMedia"] is True, str(mf["hasMedia"]))
+        check("mimetype captured", mf["mediaInfo"]["mimetype"] == "image/jpeg", str(mf["mediaInfo"]))
+        check("inline flag set", mf["mediaInfo"]["inline"] is True, str(mf["mediaInfo"]))
+        check("base64 extracted", msg_mod.inline_media(real) == "aGVsbG8=", str(msg_mod.inline_media(real)))
+
+        # The bytes must never reach MongoDB - seven small images were 90% of
+        # the collection when they did, and a real photo approaches the 16 MB
+        # document ceiling on its own.
+        check("stored payload drops the base64", "data" not in mf["raw"]["media"], str(mf["raw"]["media"]))
+        check("but keeps the metadata", mf["raw"]["media"]["mimetype"] == "image/jpeg")
+        check("the original dict is not mutated", real["media"]["data"] == "aGVsbG8=")
+
+        plain = msg_mod.message_fields("message.received", {"from": "91@c.us", "type": "text", "body": "hi"})
+        check("a text message is not media", plain["hasMedia"] is False, str(plain["hasMedia"]))
+        check("and has no mediaInfo", plain["mediaInfo"] is None)
+
+        omitted = msg_mod.message_fields(
+            "message.received",
+            {"from": "91@c.us", "type": "video", "media": {"mimetype": "video/mp4", "omitted": True}},
+        )
+        check("withheld media is still flagged", omitted["hasMedia"] is True)
+        check("marked as omitted, so it falls back to download", omitted["mediaInfo"]["omitted"] is True)
+        check("with no inline data", omitted["mediaInfo"]["inline"] is False)
+
+        print("\n-- @lid resolution --")
+        lookups: list[str] = []
+
+        async def fake_phone(contact_id):
+            lookups.append(contact_id)
+            return "917981149423" if contact_id.endswith("@lid") else None
+
+        openwa.contact_phone = fake_phone
+        bridge.settings.media_enabled = False  # isolate resolution from the media path
+
+        lid_event = {
+            "event": "message.sent",
+            "sessionId": "fake-session-uuid",
+            "data": {
+                "id": "true_259094657142792@lid_LIDTEST1_out",
+                "from": "918985370703@c.us",
+                "to": "259094657142792@lid",
+                "chatId": "259094657142792@lid",
+                "body": "sent to a privacy id",
+                "type": "text",
+                "timestamp": int(datetime.now(timezone.utc).timestamp()),
+                "contact": {"pushName": "Data"},
+            },
+        }
+        raw_lid, hdr_lid = signed(lid_event, secret)
+        await client.post(hook_path, content=raw_lid, headers=hdr_lid)
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            if lookups:
+                break
+        await asyncio.sleep(0.05)
+
+        doc = store.docs.get(("default", "true_259094657142792@lid_LIDTEST1_out")) or {}
+        check("an @lid chat triggers a lookup", lookups == ["259094657142792@lid"], str(lookups))
+        check("the number lands on the message", doc.get("contactNumber") == "917981149423", str(doc.get("contactNumber")))
+        check("and is marked as resolved", doc.get("contactIdResolved") is True)
+        check("the real status is not clobbered", doc.get("status") == "sent", str(doc.get("status")))
+
+        # A plain number needs no lookup at all.
+        before = len(lookups)
+        plain_event = json.loads(json.dumps(lid_event))
+        plain_event["data"]["id"] = "true_917981149423@c.us_PLAIN1_out"
+        plain_event["data"]["to"] = "917981149423@c.us"
+        plain_event["data"]["chatId"] = "917981149423@c.us"
+        raw_p, hdr_p = signed(plain_event, secret)
+        await client.post(hook_path, content=raw_p, headers=hdr_p)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        check("a normal number is not looked up", len(lookups) == before, str(lookups[before:]))
+
+        bridge.settings.media_enabled = True
 
         print("\n-- media filenames --")
         check("jpeg gets .jpg, not .jpe", media_mod.extension_for("image/jpeg", None) == ".jpg")

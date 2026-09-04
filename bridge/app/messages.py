@@ -55,6 +55,53 @@ def contact_number(data: dict[str, Any], chat_id: str | None) -> str | None:
     return phone_of(chat_id)
 
 
+# A media message is identified by its `media` object, not by a `hasMedia`
+# flag - the webhook payload has no such flag, whatever the REST docs show for
+# other endpoints. `type` is the backstop for a payload that names a media kind
+# but carries no object.
+MEDIA_TYPES = {"image", "video", "audio", "voice", "document", "sticker"}
+
+
+def media_info(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The media metadata, without the payload's inline base64.
+
+    The gateway inlines the whole file as base64 in `media.data`. Storing that
+    is what turned seven small images into 90% of the database, and a real
+    photo would push a single document toward MongoDB's 16 MB ceiling - so the
+    bytes are pulled out here and written to disk instead.
+    """
+    media = data.get("media")
+    if not isinstance(media, dict):
+        return None
+    return {
+        "mimetype": media.get("mimetype"),
+        "filename": media.get("filename"),
+        "sizeBytes": media.get("sizeBytes"),
+        # True when the gateway deliberately withheld the bytes - too large, or
+        # not stored. The download endpoint is the fallback in that case.
+        "omitted": bool(media.get("omitted")),
+        "inline": isinstance(media.get("data"), str) and bool(media.get("data")),
+    }
+
+
+def inline_media(data: dict[str, Any]) -> str | None:
+    """The base64 payload, when the gateway sent one."""
+    media = data.get("media")
+    if not isinstance(media, dict):
+        return None
+    blob = media.get("data")
+    return blob if isinstance(blob, str) and blob else None
+
+
+def without_media_bytes(data: dict[str, Any]) -> dict[str, Any]:
+    """A copy of the payload safe to store: same shape, minus the base64."""
+    if not isinstance(data.get("media"), dict):
+        return data
+    trimmed = dict(data)
+    trimmed["media"] = {k: v for k, v in data["media"].items() if k != "data"}
+    return trimmed
+
+
 def message_fields(event: str, data: dict[str, Any]) -> dict[str, Any]:
     """Fields for a `message.received` / `message.sent` delivery.
 
@@ -65,6 +112,7 @@ def message_fields(event: str, data: dict[str, Any]) -> dict[str, Any]:
     sender = data.get("from")
     recipient = data.get("to")
     chat_id = data.get("chatId") or (sender if direction == "in" else recipient)
+    info = media_info(data)
 
     return {
         "messageId": data.get("id"),
@@ -77,7 +125,8 @@ def message_fields(event: str, data: dict[str, Any]) -> dict[str, Any]:
         "type": data.get("type"),
         "kind": data.get("kind"),
         "isGroup": data.get("isGroup"),
-        "hasMedia": data.get("hasMedia"),
+        "hasMedia": info is not None or data.get("type") in MEDIA_TYPES,
+        "mediaInfo": info,
         "fromMe": direction == "out",
         "senderPhone": data.get("senderPhone"),
         # Pulled out of `contact` so they can be queried and indexed directly,
@@ -88,7 +137,7 @@ def message_fields(event: str, data: dict[str, Any]) -> dict[str, Any]:
         "contact": data.get("contact"),
         "timestamp": _to_datetime(data.get("timestamp")),
         "source": "webhook",
-        "raw": data,
+        "raw": without_media_bytes(data),
     }
 
 

@@ -7,6 +7,8 @@ Both directions land in one MongoDB collection.
 """
 
 import asyncio
+import base64
+import binascii
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -276,15 +278,43 @@ async def _send_and_store(
 # ----------------------------------------------------------------- media ---
 
 
-async def _save_media(message_id: str, chat_id: str, phone: str | None) -> None:
-    """Fetch one message's media and record where it was written.
+async def _save_media(
+    message_id: str,
+    chat_id: str,
+    phone: str | None,
+    inline: str | None = None,
+    info: dict[str, Any] | None = None,
+) -> None:
+    """Write one message's media to disk and record where it went.
+
+    The gateway inlines the file as base64 on the webhook itself, so the usual
+    path decodes what already arrived - no second request, and nothing to fail.
+    The download endpoint is the fallback for when it withholds the bytes
+    (`omitted`), which it does for anything over its own size cap.
 
     Detached from the delivery that triggered it, so the gateway gets its 200
-    immediately rather than waiting on a video download. Every failure is
-    recorded on the message: a photo that could not be fetched should say so on
-    the row, not only in a log line nobody reads.
+    immediately. Every failure is recorded on the message: a photo that could
+    not be saved should say so on the row, not only in a log line nobody reads.
     """
     session_name = settings.openwa_session_name
+    info = info or {}
+
+    if inline:
+        try:
+            content = base64.b64decode(inline, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            log.warning("media: %s has undecodable inline data (%s)", message_id, exc)
+            await store.record_media(
+                session_name=session_name,
+                message_id=message_id,
+                media={"error": f"inline data is not valid base64: {exc}", "savedAt": utcnow()},
+            )
+            return
+        mimetype = info.get("mimetype") or "application/octet-stream"
+        filename = info.get("filename")
+        await _write_media(message_id, phone, content, mimetype, filename)
+        return
+
     try:
         content, mimetype, filename = await openwa.download_media(chat_id, message_id)
     except OpenWAError as exc:
@@ -298,6 +328,19 @@ async def _save_media(message_id: str, chat_id: str, phone: str | None) -> None:
             media={"error": str(exc), "savedAt": utcnow()},
         )
         return
+
+    await _write_media(message_id, phone, content, mimetype, filename)
+
+
+async def _write_media(
+    message_id: str,
+    phone: str | None,
+    content: bytes,
+    mimetype: str,
+    filename: str | None,
+) -> None:
+    """Write the bytes to disk and record the result on the message."""
+    session_name = settings.openwa_session_name
 
     if len(content) > settings.media_max_bytes:
         log.warning(
@@ -332,6 +375,44 @@ async def _save_media(message_id: str, chat_id: str, phone: str | None) -> None:
         session_name=session_name, message_id=message_id, media=saved.as_document(root)
     )
     log.info("media saved: %s (%s, %d bytes)", saved.path, saved.mimetype, saved.size_bytes)
+
+
+async def _enrich(
+    message_id: str,
+    chat_id: str,
+    phone: str | None,
+    *,
+    inline: str | None,
+    info: dict[str, Any] | None,
+    save_media: bool,
+) -> None:
+    """Fill in what the webhook could not tell us, then store the media.
+
+    Resolution comes first so the media filename can carry the number too.
+    Both run in one detached task, so the gateway still gets its 200 straight
+    away rather than waiting on a lookup and a file write.
+    """
+    try:
+        # An `@lid` is a privacy id, not a number. Inbound messages get
+        # `senderPhone` attached by the gateway, but an outbound one does not -
+        # its sender is you - so the recipient has to be resolved on demand.
+        if not phone and chat_id and chat_id.endswith("@lid"):
+            resolved = await openwa.contact_phone(chat_id)
+            if resolved:
+                phone = resolved
+                await store.set_fields(
+                    session_name=settings.openwa_session_name,
+                    message_id=message_id,
+                    fields={"contactNumber": resolved, "contactIdResolved": True},
+                )
+                log.info("resolved %s -> %s", chat_id, resolved)
+            else:
+                log.debug("could not resolve %s to a number", chat_id)
+
+        if save_media:
+            await _save_media(message_id, chat_id, phone, inline=inline, info=info)
+    except Exception:
+        log.exception("enrich: unhandled failure for %s", message_id)
 
 
 def _spawn(coro) -> None:
@@ -517,18 +598,33 @@ async def openwa_webhook(request: Request) -> dict[str, Any]:
         )
         log.info("%s %s %s", event, fields.get("chatId"), (fields.get("body") or "")[:60])
 
-        # Media arrives as a flag, not bytes. Fetch it once - the claim is
-        # atomic, so a redelivered event does not download it again.
+        # Two things the webhook cannot give us: an @lid's real number, and the
+        # media file once its inline copy has been stripped. Both are handled
+        # in one detached task, claimed atomically so a redelivered event does
+        # neither twice.
+        chat_id = fields.get("chatId")
         wanted = event == msg_map.INBOUND_EVENT or settings.media_outbound
+        save_media = bool(settings.media_enabled and wanted and fields.get("hasMedia"))
+        needs_number = bool(
+            not fields.get("contactNumber") and chat_id and chat_id.endswith("@lid")
+        )
+
         if (
-            settings.media_enabled
-            and wanted
-            and fields.get("hasMedia")
-            and message_id
-            and fields.get("chatId")
+            message_id
+            and chat_id
+            and (save_media or needs_number)
             and await store.claim_media(session_name=session_name, message_id=message_id)
         ):
-            _spawn(_save_media(message_id, fields["chatId"], fields.get("contactNumber")))
+            _spawn(
+                _enrich(
+                    message_id,
+                    chat_id,
+                    fields.get("contactNumber"),
+                    inline=msg_map.inline_media(data),
+                    info=fields.get("mediaInfo"),
+                    save_media=save_media,
+                )
+            )
 
     elif event in ("message.ack", "message.failed"):
         message_id, status = msg_map.ack_fields(data)

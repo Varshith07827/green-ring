@@ -69,9 +69,10 @@ class Settings(BaseSettings):
     # Skip anything larger. The gateway has its own cap (50 MiB by default);
     # this one bounds what lands on your disk.
     media_max_bytes: int = 25 * 1024 * 1024
-    # Media you send is fetchable too, but doubles the storage for a copy you
-    # already have. Off by default.
-    media_outbound: bool = False
+    # Media you send counts too. A photo composed on the linked phone is NOT a
+    # copy the bridge already holds - only API sends are - so leaving this off
+    # loses every picture you take and send yourself.
+    media_outbound: bool = True
 
     # --- Event ingress (OpenWA -> bridge) -----------------------------------
     # Internal plumbing on loopback. Nothing here is your endpoint.

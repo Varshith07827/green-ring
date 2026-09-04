@@ -24,6 +24,7 @@ class OpenWAClient:
         self.base_url = base_url.rstrip("/")
         self.session_name = session_name
         self._session_id: str | None = None
+        self._phone_cache: dict[str, str | None] = {}
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
@@ -131,6 +132,38 @@ class OpenWAClient:
                     json=payload,
                 )
             raise
+
+    async def contact_phone(self, contact_id: str) -> str | None:
+        """Resolve a privacy id (`@lid`) to a phone number, best-effort.
+
+        WhatsApp increasingly identifies people by an `@lid` rather than their
+        number, and an outbound message carries no `senderPhone` - the sender is
+        you, so the gateway's inbound-only resolution does not help. This is the
+        on-demand equivalent.
+
+        Answers are cached, including the misses: an `@lid` the account has
+        never seen resolves to null and would otherwise be looked up again on
+        every message from that chat.
+        """
+        if contact_id in self._phone_cache:
+            return self._phone_cache[contact_id]
+
+        session_id = await self.session_id()
+        try:
+            result = await self._request(
+                "GET", f"/api/sessions/{session_id}/contacts/{contact_id}/phone"
+            )
+        except OpenWAError as exc:
+            log.debug("could not resolve %s to a phone: %s", contact_id, exc)
+            return None
+
+        phone = (result or {}).get("phone")
+        phone = phone.strip() if isinstance(phone, str) and phone.strip() else None
+        # Bounded, so a long-running process with many contacts cannot grow
+        # without limit.
+        if len(self._phone_cache) < 5000:
+            self._phone_cache[contact_id] = phone
+        return phone
 
     async def download_media(self, chat_id: str, message_id: str) -> tuple[bytes, str, str | None]:
         """Fetch a message's media bytes.

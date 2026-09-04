@@ -148,6 +148,19 @@ class Store:
             {"sessionName": session_name, "messageId": message_id}
         )
 
+    async def set_fields(
+        self, *, session_name: str, message_id: str, fields: dict[str, Any]
+    ) -> bool:
+        """Merge fields into an existing message, touching nothing else."""
+        payload = {k: v for k, v in fields.items() if v is not None}
+        if not payload:
+            return False
+        payload["updatedAt"] = utcnow()
+        result = await self.messages.update_one(
+            {"sessionName": session_name, "messageId": message_id}, {"$set": payload}
+        )
+        return result.matched_count > 0
+
     async def claim_media(self, *, session_name: str, message_id: str) -> bool:
         """Take ownership of downloading this message's media, exactly once.
 
