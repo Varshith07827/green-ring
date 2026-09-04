@@ -1,431 +1,298 @@
 # OpenWA Bridge
 
-Send a WhatsApp message — text or a file — by POSTing `{"id": "<phone>", "msg": "<text>"}`, and
-archive every message, both directions, in MongoDB, with photos and voice notes written to disk.
+Send WhatsApp messages by POSTing JSON. Archive every message, both directions, in MongoDB, with
+photos and voice notes written to disk.
 
 Runs natively on Linux or Windows. **No Docker.**
 
 ```
-   ┌─────────────────── your server ────────────────────┐
-   │                                                    │
-   │   bridge (Python, :8000)                           │
-   │     POST /send   {id, msg}                         │
-   │                     │                              │
-   │                     ▼                              │
-   │   OpenWA gateway (Node, :2785) ─ headless Chrome ──┼──► WhatsApp
-   │            │                                       │
-   │            ▼  every message, in and out            │
-   │     ┌──────────────┬──────────────┐                │
-   │  MongoDB        data/media/    (text, who,         │
-   │  (messages)     (the files)     when, status)      │
-   └────────────────────────────────────────────────────┘
+   your app ──POST /send──► bridge (:8000) ──► OpenWA gateway (:2785) ──► WhatsApp
+                                  │
+                                  ▼
+                          MongoDB + data/media/
 ```
 
 | Path                                    | What it is                                                          |
 | --------------------------------------- | ------------------------------------------------------------------- |
 | `repo/`                                 | [OpenWA](https://github.com/rmyndharis/OpenWA), unmodified upstream |
 | `bridge/`                               | The Python service — the part you talk to                           |
-| `.env`                                  | The only file you configure — four settings                          |
-| `start.sh` / `start.ps1`                | Sets up and starts everything — Linux / Windows                     |
+| `.env`                                  | The only file you configure                                         |
+| `start.sh` / `start.ps1`                | Sets up and starts everything                                       |
 | `install-service.sh`                    | Registers both as systemd services (Linux)                          |
 | `data/media/`                           | Photos, voice notes and documents, by date. Not in git.             |
 | `OpenWA-Bridge.postman_collection.json` | Import into Postman                                                 |
 
 ---
 
-## Setting it up from scratch
-
-### Linux (Debian/Ubuntu)
+## Setup
 
 ```bash
 git clone https://github.com/Varshith07827/green-ring.git
 cd green-ring
-./start.sh
+./start.sh                 # Linux    (.\start.ps1 on Windows)
 ```
 
-Then, for a server you are not sitting in front of:
+It installs whatever is missing (Node 22+, Python 3.10+, Chrome), asks for your **MongoDB URI**,
+writes `.env`, builds, and starts both processes — printing your `BRIDGE_API_KEY`.
+
+**Then once:** open <http://localhost:2785>, start the `default` session, scan the QR from
+WhatsApp → Settings → Linked devices. The pairing survives restarts.
 
 ```bash
-./install-service.sh
+curl http://localhost:8000/health      # "status":"ready" means you are live
 ```
 
-That registers both as systemd services, so they start on boot, restart on
-failure, and survive you logging out. `./start.sh` alone runs them in your
-terminal and stops when it closes — fine for a first look, wrong for a server.
-
-Logs are `journalctl -u openwa-gateway -f` and `journalctl -u openwa-bridge -f`.
-Remove with `./install-service.sh --remove`.
-
-### Windows
-
-```powershell
-git clone https://github.com/Varshith07827/green-ring.git
-cd green-ring
-.\start.ps1
-```
-
-### Both scripts do the same thing
-
-They check for **Node 22+**, **Python 3.10+** and a browser, and install whatever is missing — apt
-and NodeSource on Linux, winget on Windows. Then they ask one question — your MongoDB URI — and from
-that write `.env`, install dependencies, build, and start both processes, printing your
-`BRIDGE_API_KEY`, the token you send from Postman.
-
-If `MONGO_URI` points at this machine and nothing is listening there, Windows offers to install
-MongoDB; Linux tells you where to get it. A remote or Atlas URI is left alone either way — that's
-somebody else's server.
-
-On Linux, Chrome comes from Puppeteer's own Chrome for Testing download on x64, and the distro's
-`chromium` on arm64, which has no Chrome for Testing build. The shared libraries it needs are
-installed alongside.
-
-When everything is already present it says nothing about any of this and goes straight to work.
-
-`.env` is deliberately **not** in the repo, since it holds secrets. The gateway's own `repo/.env` is
-**generated from it** on every run, which is what keeps the key those two processes share in step —
-setting it by hand is where a fresh install usually goes wrong.
-
-**Then, once:** open <http://localhost:2785>, start the `default` session and scan the QR from
-WhatsApp → Settings → Linked devices → Link a device. The session already exists — the bridge creates
-it at startup — so you only press start and scan. The pairing survives restarts
-(`AUTO_START_SESSIONS=true`, session data in `repo/data/sessions`), so this is a one-time step.
-
-Check it took:
-
-```bash
-curl http://localhost:8000/health
-```
-
-`{"ok":true,...,"session":{"status":"ready","phone":"91..."}}` means you are live.
-
-Every run after the first is just the same start script — it skips setup, install and build when
-they are already done.
+For a server, `./install-service.sh` — starts on boot, restarts on failure, survives logout.
 
 ---
 
-## Sending
+## Calling it
 
-```
-POST http://localhost:8000/send
-Authorization: Bearer <BRIDGE_API_KEY from .env>
-Content-Type: application/json
+Everything that sends is `POST`, takes JSON, and uses the same auth header.
 
-{ "id": "919876543210", "msg": "Hello from Postman" }
-```
-
-**One endpoint for every chat.** The recipient is `id` in the body — there is no per-chat URL to
-bind, register, or keep in step. Any chat reachable from the linked number can be messaged
-immediately.
-
-```json
-{
-  "ok": true,
-  "messageId": "true_919876543210@c.us_3EB0ABCD",
-  "chatId": "919876543210@c.us",
-  "status": "sent",
-  "storedId": "66d3f1..."
-}
-```
-
-**`id`** is the phone number *with country code*. `+91 98765-43210`, `919876543210` and
-`00919876543210` all work — spaces, `+`, dashes and brackets are stripped. A group id
-(`120363...@g.us`) passes through untouched, so the same endpoint sends to groups.
-
-A number with no country code is **rejected**, so a message cannot silently go to the wrong country.
-Set `DEFAULT_COUNTRY_CODE=91` in `.env` to accept bare national numbers instead.
-
-**`msg`** is text, up to 4096 characters — or the caption when you send a file, where WhatsApp's
-limit is 1024. `number`/`to`/`phone` and `message`/`text`/`body` are accepted as aliases.
-
-### Sending a file
-
-Two ways, same endpoint. **A URL**, when the file is already hosted — the gateway fetches it, so
-nothing large passes through the bridge:
-
-```json
-{ "id": "919876543210", "msg": "on the roof", "media": "https://example.com/photo.jpg" }
-```
-
-**An upload**, when the file is on the machine making the call — Postman's *form-data* tab, or:
+**curl** — set these once:
 
 ```bash
-curl -X POST http://localhost:8000/send \
-  -H "Authorization: Bearer $BRIDGE_API_KEY" \
-  -F id=919876543210 \
-  -F msg="from my laptop" \
-  -F file=@holiday.png
+BRIDGE=http://localhost:8000
+KEY=$(grep BRIDGE_API_KEY .env | cut -d= -f2)
+
+curl -X POST $BRIDGE/<path> -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" -d '<body>'
 ```
 
-`media` also accepts a `data:` URI or raw base64, so a browser can post what it already holds.
+**Postman** — import `OpenWA-Bridge.postman_collection.json`, then set two collection variables:
+`baseUrl` (`http://localhost:8000`) and `apiKey` (your `BRIDGE_API_KEY`). For a new request:
 
-**You never pick an endpoint.** The mimetype decides which kind of WhatsApp message it becomes:
+| | |
+| --- | --- |
+| Method / URL | `POST` `{{baseUrl}}/<path>` |
+| Authorization | Type **Bearer Token**, value `{{apiKey}}` |
+| Body | **raw** → **JSON**, paste `<body>` |
 
-| Mimetype        | Sent as    | Looks like                        |
-| --------------- | ---------- | --------------------------------- |
-| `image/*`       | image      | preview bubble                    |
-| `video/*`       | video      | player bubble                     |
-| `audio/*`       | audio      | file bubble with a play button    |
-| anything else   | document   | filename with a download icon     |
+Only `<path>` and `<body>` change between calls, which is what the table below gives.
 
-Override it with `"type"` — `image`, `video`, `audio`, `voice`, `document` or `sticker`. `voice` is
-the one worth knowing: it sends audio as a **voice note**, the mic bubble with a waveform rather than
-a file attachment. Send `audio/ogg; codecs=opus` for reliable playback.
+---
 
-The response names what was sent and where the copy landed:
+## Every command
 
-```json
-{
-  "ok": true,
-  "messageId": "true_919876543210@c.us_3EB0ABCD",
-  "chatId": "919876543210@c.us",
-  "status": "sent",
-  "type": "image",
-  "mediaPath": "2026/09/04/919876543210_MED7_a1b2c3d4e5.png"
-}
-```
+`id` is always **the chat** — a phone number with country code, or a group jid like
+`120363...@g.us`. `messageId` is the WhatsApp id returned by `/send`.
 
-**Uploads are archived; URL sends are not.** When the bridge holds the bytes it writes them under
-`data/media/` and records the path, exactly as it does for received media. A URL send is fetched by
-the gateway and those bytes never pass through here — copying them would double the transfer for a
-file you already host — so `mediaPath` is `null` and `mediaInfo.sourceUrl` records where it came
-from instead.
+| Path        | What it does                       | Body |
+| ----------- | ---------------------------------- | ---- |
+| `/send`     | Send text                          | `{"id":"919876543210","msg":"Hello"}` |
+| `/send`     | Send a file already hosted         | `{"id":"919876543210","msg":"caption","media":"https://host/photo.jpg"}` |
+| `/reply`    | Reply, quoting a message           | `{"id":"919876543210","messageId":"<id>","msg":"a reply"}` |
+| `/react`    | React — `""` removes it            | `{"id":"919876543210","messageId":"<id>","emoji":"👍"}` |
+| `/forward`  | Forward from one chat to another   | `{"id":"919876543210","from":"919111111111","messageId":"<id>"}` |
+| `/location` | Drop a pin on the map              | `{"id":"919876543210","latitude":17.385,"longitude":78.487,"description":"Hyderabad"}` |
+| `/contact`  | Send a contact card                | `{"id":"919876543210","name":"Bob","number":"919111111111"}` |
+| `/poll`     | Send a poll (2–12 options)         | `{"id":"919876543210","question":"Lunch?","options":["Park","Beach"]}` |
+| `/edit`     | Change text you sent               | `{"id":"919876543210","messageId":"<id>","msg":"corrected"}` |
+| `/delete`   | Delete it                          | `{"id":"919876543210","messageId":"<id>","forEveryone":true}` |
+| `/star`     | Star, or un-star with `false`      | `{"id":"919876543210","messageId":"<id>","star":true}` |
+| `/pin`      | Pin for 24h / 7d / 30d             | `{"id":"919876543210","messageId":"<id>","durationSeconds":86400}` |
+| `/unpin`    | Unpin                              | `{"id":"919876543210","messageId":"<id>"}` |
 
-Uploads are capped near 24 MiB, measured *after* base64 encoding, which is what the gateway's
-25 MB body limit actually sees. Past that, host the file and send its URL.
+Reads — all `GET`, same Bearer token:
 
-**The bytes outrank the filename.** An uploaded file is checked against its own magic bytes, because
-a name is a claim and the content is not. Two things follow:
+| Path               | Auth  | What it does                                                |
+| ------------------ | ----- | ----------------------------------------------------------- |
+| `/health`          | none  | Mongo + gateway + session state                             |
+| `/messages`        | token | Recent messages from Mongo (`limit`, `chatId`, `direction`) |
+| `/session`         | token | Full session detail                                         |
+| `/qr`              | token | Pairing QR as a PNG data URL                                |
+| `/docs`            | none  | Swagger UI — try any of these in the browser                |
+| `/events/register` | token | `POST`. Recreate the session + event subscription           |
 
-- A file that is really HTML, sent as an image, video or audio, is **refused with a 400** that says
-  so. This is the `curl -o photo.jpg` case — the URL answered 400, curl wrote the error page under
-  the name you asked for, and everything downstream believed the extension.
-- A file whose extension is simply wrong is **corrected**: a PNG called `mystery.txt` is sent as an
-  image. Set `mimetype` explicitly and that is respected instead.
-
-When the gateway does fail a media send, the bridge names the likely cause rather than passing on
-`500: Internal server error`. A URL send says which URL and suggests checking it — many hosts refuse
-server-side requests, which is the single most common surprise with `media` — and a byte send names
-the type it was refused as.
-
-### Everything else you can do to a message
-
-Same convention throughout: `id` is the chat — a phone number or a group jid — and `messageId` is
-the WhatsApp id that `/send` and `/messages` hand back.
-
-| Path        | Body                                            | Does                                    |
-| ----------- | ----------------------------------------------- | --------------------------------------- |
-| `/reply`    | `id`, `messageId`, `msg`                        | Reply, quoting that message             |
-| `/react`    | `id`, `messageId`, `emoji`                      | React — `""` removes it                 |
-| `/forward`  | `id`, `from`, `messageId`                       | Forward from one chat to another        |
-| `/location` | `id`, `latitude`, `longitude`, `description?`   | Drop a pin                              |
-| `/contact`  | `id`, `name`, `number`                          | Send a contact card                     |
-| `/poll`     | `id`, `question`, `options[]`                   | Send a poll (2–12 options)              |
-| `/edit`     | `id`, `messageId`, `msg`                        | Change the text of something you sent   |
-| `/delete`   | `id`, `messageId`, `forEveryone?`               | Delete it                               |
-| `/star`     | `id`, `messageId`, `star?`                      | Star, or un-star with `false`           |
-| `/pin`      | `id`, `messageId`, `durationSeconds?`           | Pin for 24h / 7d / 30d                  |
-| `/unpin`    | `id`, `messageId`                               | Unpin                                   |
+A worked example, so the pattern is concrete:
 
 ```bash
-curl -X POST http://localhost:8000/react -H "Authorization: Bearer $BRIDGE_API_KEY" \
+curl -X POST $BRIDGE/reply -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{"id":"919876543210","messageId":"true_919876543210@c.us_3EB0ABCD","emoji":"👍"}'
+  -d '{"id":"919876543210","messageId":"true_919876543210@c.us_3EB0ABCD","msg":"a reply"}'
 ```
 
-**How these land in MongoDB matters.** The five that *create* a message — reply, forward, location,
-contact, poll — get their own document, like any other send. The six that *change* one — react,
-edit, delete, star, pin — are merged into the row of the message they acted on. Writing a separate
-document for a reaction would leave the archive claiming two messages where the conversation has
-one.
+**Groups need nothing special** — put the group jid in `id`. List yours with:
 
-Two consequences worth knowing:
+```bash
+GKEY=$(grep OPENWA_API_KEY .env | cut -d= -f2)
+SID=$(curl -s -H "X-API-Key: $GKEY" http://localhost:2785/api/sessions | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
+curl -s -H "X-API-Key: $GKEY" "http://localhost:2785/api/sessions/$SID/groups?limit=20"
+```
 
-- **`/edit` keeps the old text.** The new body replaces the old one on the row, and the previous
-  version is appended to `editHistory` with a timestamp. An archive that silently rewrote history
-  would be a worse record than the phone it mirrors.
-- **`/delete` marks, it does not remove.** The row gains `deleted`, `deletedForEveryone` and
-  `deletedAt`, and keeps its body. That a message was sent and then withdrawn is exactly the sort of
-  thing an archive exists to remember.
+**Aliases**, if an existing client sends different names: `number` / `to` / `phone` / `chatId` for
+`id`, and `message` / `text` / `body` for `msg`.
 
-Acting on a message older than this bridge is fine — the send goes through and there is simply no
-row to update.
+---
 
-| Method | Path               | Auth  | Purpose                                                     |
-| ------ | ------------------ | ----- | ----------------------------------------------------------- |
-| `POST` | `/send`            | token | Send text or a file to any chat, by `id`                    |
-| `POST` | *(the 11 above)*   | token | Reply, react, forward, edit, delete, star, pin…             |
-| `GET`  | `/health`          | —     | Mongo + gateway + session state                             |
-| `GET`  | `/messages`        | token | Recent messages from Mongo (`limit`, `chatId`, `direction`) |
-| `GET`  | `/session`         | token | Full session detail                                         |
-| `GET`  | `/qr`              | token | Pairing QR as a PNG data URL                                |
-| `POST` | `/events/register` | token | Recreate the session + event subscription                   |
-| `GET`  | `/docs`            | —     | Swagger UI                                                  |
+## Uploading a file
 
-`/send` takes JSON, `multipart/form-data` or a urlencoded form, on the same URL — whichever tab you
-picked in Postman works.
+The one call that is not plain JSON.
 
-Auth is `Authorization: Bearer <BRIDGE_API_KEY>` (`X-API-Key: <key>` is still accepted). `401` is a
-missing or wrong token, `400` a bad number, an unusable `media` value, or a session that is not
-ready, `413` a file too large to upload, `422` a malformed body.
+**curl:**
 
-> The bridge listens on `0.0.0.0:8000`, so anything that can route to this machine can reach it —
-> other PCs on the LAN, or the internet if a port is forwarded to it. From a machine that *cannot*
-> route here, a direct `POST /send` will not arrive; that direction needs the bridge reachable
-> (LAN, VPN, port forward, or a tunnel).
+```bash
+curl -X POST $BRIDGE/send -H "Authorization: Bearer $KEY" \
+  -F id=919876543210 -F msg="a caption" -F file=@holiday.png
+```
+
+**Postman:** `POST {{baseUrl}}/send`, Body → **form-data**, three rows:
+
+| Key    | Type | Value             |
+| ------ | ---- | ----------------- |
+| `id`   | Text | `919876543210`    |
+| `msg`  | Text | `a caption`       |
+| `file` | File | *(pick the file)* |
+
+Leave `Content-Type` alone — Postman sets it.
+
+**You never pick a message type.** The mimetype decides: `image/*` → photo, `video/*` → video,
+`audio/*` → audio, anything else → document. Override with `"type"`: `image`, `video`, `audio`,
+`voice`, `document`, `sticker`. **`voice`** sends audio as a real voice note — mic bubble with a
+waveform — rather than a file attachment; use `audio/ogg; codecs=opus`.
+
+Three things worth knowing:
+
+- **Uploads are archived, URL sends are not.** Bytes that pass through the bridge are written to
+  `data/media/` and the path comes back as `mediaPath`. A URL is fetched by the gateway instead, so
+  `mediaPath` is `null` and `mediaInfo.sourceUrl` records where it came from.
+- **Uploads cap near 24 MiB**, measured after base64 encoding. Larger than that: host the file and
+  send its URL.
+- **The bytes outrank the filename.** A file that is really HTML, sent as an image, is refused with
+  a 400 — that is the `curl -o photo.jpg` case, where the URL returned an error page and curl wrote
+  it under the name you asked for. A merely wrong extension is corrected instead: a PNG called
+  `mystery.txt` sends as an image.
+
+`media` also accepts a `data:` URI or raw base64.
 
 ---
 
 ## What lands in MongoDB
 
-Database `openwa`, collection `messages`. One document per WhatsApp message, both directions:
+Database `openwa`, collection `messages`. One document per message, both directions — including
+messages you type on the phone itself.
 
 ```json
 {
-  "sessionName": "default",
   "messageId": "true_919876543210@c.us_3EB0ABCD",
   "direction": "out",
   "chatId": "919876543210@c.us",
   "phone": "919876543210",
-  "body": "Hello from Postman",
+  "contactName": "Bob",
+  "contactNumber": "919876543210",
+  "body": "Hello",
   "type": "text",
   "status": "read",
-  "fromMe": true,
-  "timestamp": "2026-09-02T20:31:04Z",
   "source": "api",
-  "createdAt": "...",
-  "updatedAt": "..."
+  "timestamp": "2026-09-02T20:31:04Z",
+  "media": {
+    "path": "2026/09/04/919876543210_3EB0ABCD_4a1ac396a5.jpg",
+    "mimetype": "image/jpeg",
+    "sizeBytes": 184203
+  }
 }
 ```
 
-- **`direction`** is `in` or `out`. **`status`** moves `sent → delivered → read` as receipts arrive,
-  or becomes `failed` / `revoked` / `edited`.
-- **Messages you type on the phone itself are captured too**, so the archive is the whole
-  conversation, not just API traffic.
-- `source` is `api` (from `/send`) or `webhook` (seen by the engine — including messages you typed
-  on your own phone).
-- **`contactName` and `contactNumber`** are the other party, pulled out as top-level fields so you
-  can query and index them. The name prefers your saved contact name over `pushName`, which is
-  whatever they call themselves this week. The number falls back through the contact record, the
-  gateway's `senderPhone` (for privacy-id `@lid` senders), then the chat id — and is `null` for a
+- `status` moves `sent → delivered → read`, or becomes `failed` / `revoked` / `edited`.
+- `source` is `api` (you called the bridge) or `webhook` (the engine saw it).
+- `contactName` prefers your saved contact name over `pushName`. `contactNumber` is `null` for a
   group, which has no single number.
-- **`media`** is present on any message that carried a file:
+- `media.path` is relative, so the archive survives the project moving. A failed download leaves
+  `{"error": …}` there rather than nothing.
+- `(sessionName, messageId)` is unique and every write is an upsert — retries never duplicate.
+- Raw event envelopes go to the `events` collection; `STORE_RAW_EVENTS=false` turns that off.
 
-```json
-"media": {
-  "path": "2026/09/04/917981149423_3EB0ABCD_4a1ac396a5.jpg",
-  "absolutePath": "C:\Users\nlabs\Desktop\openwa\data\media\2026\09\04\...",
-  "filename": "photo.jpg",
-  "mimetype": "image/jpeg",
-  "sizeBytes": 184203,
-  "savedAt": "2026-09-04T00:31:00Z"
-}
-```
+**Actions record two different ways.** Reply, forward, location, contact and poll create their own
+document. React, edit, delete, star and pin are merged into the row of the message they acted on — a
+separate document per reaction would claim two messages where the chat has one. Two consequences:
 
-  Photos, voice notes, video and documents are fetched from the gateway and written under
-  `data/media/`, laid out by date so no directory grows unmanageable. `path` is relative, so the
-  archive survives the project moving; `absolutePath` is for opening it now. If a download fails the
-  field holds `{"error": …}` instead — a file that could not be fetched says so on the row rather
-  than only in a log.
-- `(sessionName, messageId)` is unique and every write is an upsert, so the `/send` row and the
-  engine's own event for it merge into one document and retries never duplicate.
-- Raw event envelopes go to the `events` collection. Turn that off with `STORE_RAW_EVENTS=false`.
+- **`/edit` keeps the old text**, appended to `editHistory` with a timestamp.
+- **`/delete` marks, it does not remove** — the row gains `deleted`, `deletedForEveryone` and
+  `deletedAt`, and keeps its body.
 
 ---
 
 ## Configuration
 
-One file, `.env` at the root, holding the four settings that have no usable default. Everything else
-falls back to a working default and only belongs in the file if you are changing it — `.env.example`
-lists the full set, commented.
+One file, `.env` at the root. Four settings; everything else has a working default.
+`.env.example` lists the full set, commented.
 
-| Setting          | Note                                                                                  |
-| ---------------- | ------------------------------------------------------------------------------------- |
-| `MONGO_URI`      | Currently the **local MongoDB service** on this machine, verified working. Change it to archive elsewhere. |
-| `BRIDGE_API_KEY` | The bearer token Postman sends as `Authorization: Bearer <key>`.                       |
-| `OPENWA_API_KEY` | Shared with the gateway. Adopted from `repo/data/.api-key` when the gateway has already seeded one. |
-| `EVENTS_SECRET`  | Signs the gateway's internal event deliveries.                                         |
+| Setting          | What it is                                                                  |
+| ---------------- | --------------------------------------------------------------------------- |
+| `MONGO_URI`      | Where messages are archived                                                 |
+| `BRIDGE_API_KEY` | The bearer token you send from Postman                                      |
+| `OPENWA_API_KEY` | Shared with the gateway; adopted from `repo/data/.api-key` if already seeded |
+| `EVENTS_SECRET`  | Signs the gateway's event deliveries to the bridge                          |
 
-Useful optional ones: `MEDIA_ENABLED`, `MEDIA_DIR`, `MEDIA_MAX_BYTES` (25 MiB), `MEDIA_OUTBOUND`
-(off — your own sent media is a copy you already have), and `DEFAULT_COUNTRY_CODE`.
+Useful optional ones: `BRIDGE_PORT`, `BRIDGE_HOST`, `MEDIA_DIR`, `MEDIA_MAX_BYTES`,
+`DEFAULT_COUNTRY_CODE`.
 
-Both `.env` files hold secrets — keep them off GitHub (`bridge\.gitignore` covers its own).
+`repo/.env` is **generated** from this file on every run — don't edit it.
+
+Response codes: `401` bad token · `400` bad number, unusable `media`, or session not ready ·
+`413` file too large · `422` malformed body · `502` the gateway refused it.
 
 ---
 
-## Why the install looks unusual
+## Running unattended
 
-**Dependencies go in with `npm ci --ignore-scripts`, then `node scripts/postinstall.js` by hand.**
-Necessary, not a shortcut. `better-sqlite3` has no install script, so npm falls back to running
-`node-gyp rebuild` — which wants a full C++ toolchain (Visual Studio Build Tools on Windows,
-several GB). The package already ships prebuilt binaries for every platform this runs on, and its
-loader prefers them over anything node-gyp would produce, so skipping the build costs nothing.
-Running `postinstall.js` afterwards restores the ten upstream `whatsapp-web.js`/`baileys` patches a
-plain `--ignore-scripts` install would have skipped — those do matter. Both start scripts do this in
-the right order.
-
-**Puppeteer therefore never downloads its own browser**, so `PUPPETEER_EXECUTABLE_PATH` in
-`repo/.env` is set explicitly — to the installed Chrome on Windows, and on Linux to Puppeteer's
-Chrome for Testing (x64) or the distro chromium (arm64). Regenerated on every run, so a machine
-change is picked up automatically.
-
-**`SSRF_ALLOWED_HOSTS=localhost,127.0.0.1` is load-bearing.** The gateway refuses to register an
-event subscription pointing at a loopback address unless it is allowlisted, and the bridge listens on
-loopback. Remove it and incoming messages silently stop being recorded.
-
-**Harmless startup noise:** `Docker not available` on both platforms (container orchestration you are
-not using), and `chmod 0o600 failed … ENOENT` on Windows, where the gateway hardens a file the way
-Linux would. Neither affects anything.
-
-## Keeping it running unattended
-
-Both start scripts run the processes in your terminal, and they **die when it closes**. That is fine
-for a first look and wrong for a server.
-
-**Linux** — systemd, which is the whole reason `install-service.sh` exists:
+The start scripts run in your terminal and die when it closes. For a server:
 
 ```bash
-./install-service.sh
+./install-service.sh                       # install
+journalctl -u openwa-bridge -f             # logs
+sudo systemctl restart openwa-bridge       # restart
+./install-service.sh --remove              # uninstall
 ```
 
-Starts on boot, restarts on failure, survives logout, and caps the gateway's memory so one runaway
-Chrome cannot take the machine down with it. Logs go to the journal:
+On Windows, [NSSM](https://nssm.cc/) pointing at `repo\dist\main` and
+`bridge\.venv\Scripts\python.exe -m app.main`.
+
+**After a `git pull` that changes `bridge/requirements.txt`**, systemd will not reinstall for you:
 
 ```bash
-journalctl -u openwa-gateway -f
-journalctl -u openwa-bridge -f
+bridge/.venv/bin/python -m pip install -r bridge/requirements.txt
 ```
 
-**Windows** — [NSSM](https://nssm.cc/), pointing at this checkout:
+`./start.sh` does this automatically; `systemctl restart` does not.
 
-```powershell
-nssm install OpenWA "C:\Program Files\nodejs\node.exe" "dist\main"
-nssm set OpenWA AppDirectory "<path>\repo"
+---
 
-nssm install OpenWABridge "<path>\bridge\.venv\Scripts\python.exe" "-m app.main"
-nssm set OpenWABridge AppDirectory "<path>\bridge"
+## Notes
+
+**Use a dedicated number.** This drives WhatsApp Web through a reverse-engineered client, not Meta's
+official API. WhatsApp can restrict or ban a number for automated use. Warm it up before sending in
+volume and keep the pace human.
+
+**Secure the ports before going live.** The bridge listens on `0.0.0.0:8000` and the dashboard on
+`:2785`, both plain HTTP — your token crosses the network in clear text, and the dashboard controls
+the account. Put them behind nginx with TLS, or restrict them with `ufw` and reach the dashboard
+over an SSH tunnel:
+
+```bash
+ssh -L 2785:localhost:2785 user@server      # then browse http://localhost:2785
 ```
 
-Start order does not matter either way: the bridge retries registration via `POST /events/register`,
-and the gateway retries deliveries.
+**Install oddities, all deliberate.** `npm ci --ignore-scripts` then `node scripts/postinstall.js`
+by hand: npm would otherwise run a `node-gyp` build of `better-sqlite3`, which needs a full C++
+toolchain, while the package already ships prebuilt binaries its loader prefers — but the upstream
+engine patches still have to be applied. `PUPPETEER_EXECUTABLE_PATH` is set explicitly since
+Puppeteer never downloads its own browser. `SSRF_ALLOWED_HOSTS=localhost,127.0.0.1` is load-bearing:
+the gateway refuses to deliver events to a loopback address unless it is allowlisted, and removing
+it makes incoming messages silently stop being recorded.
 
-## Before you connect a real number
+**Harmless startup noise:** `Docker not available`, and `chmod 0o600 failed … ENOENT` on Windows.
 
-This drives WhatsApp Web through a reverse-engineered client, not Meta's official API. WhatsApp can
-restrict or ban a number for automated use. **Use a dedicated number you can afford to lose**, warm
-it up for a few days before sending in volume, and keep the pace human. `repo/README.md` has
-upstream's full guidance.
+---
 
 ## Testing without touching WhatsApp
 
 ```bash
-bridge/.venv/bin/python bridge/scripts/selftest.py        # Linux
+bridge/.venv/bin/python bridge/scripts/selftest.py          # Linux
+bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py  # Windows
 ```
 
-```powershell
-bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py
-```
-
-**161 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
-running: auth on both header styles, number parsing, the send path, every event branch, media
-detection and filenames, contact resolution, media sending by URL and by upload, byte sniffing,
-every route in the send family, and number normalisation.
+**161 checks** with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
+running: auth on both header styles, number parsing, every send path, every event branch, media
+detection and filenames, contact resolution, byte sniffing, and every route in the send family.
