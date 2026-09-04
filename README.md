@@ -1,8 +1,7 @@
 # OpenWA Bridge
 
-Send a WhatsApp message by POSTing `{"id": "<phone>", "msg": "<text>"}` — from this machine, or from
-anywhere via a queue — and archive every message, both directions, in MongoDB, with photos and voice
-notes written to disk.
+Send a WhatsApp message by POSTing `{"id": "<phone>", "msg": "<text>"}` and archive every message,
+both directions, in MongoDB, with photos and voice notes written to disk.
 
 Runs natively on Linux or Windows. **No Docker.**
 
@@ -10,9 +9,9 @@ Runs natively on Linux or Windows. **No Docker.**
    ┌─────────────────── your server ────────────────────┐
    │                                                    │
    │   bridge (Python, :8000)                           │
-   │     POST /send   {id, msg}   ───────┐              │
-   │     GET  POLL_URL  every 3s  ───────┤              │
-   │                                     ▼              │
+   │     POST /send   {id, msg}                         │
+   │                     │                              │
+   │                     ▼                              │
    │   OpenWA gateway (Node, :2785) ─ headless Chrome ──┼──► WhatsApp
    │            │                                       │
    │            ▼  every message, in and out            │
@@ -26,7 +25,7 @@ Runs natively on Linux or Windows. **No Docker.**
 | --------------------------------------- | ------------------------------------------------------------------- |
 | `repo/`                                 | [OpenWA](https://github.com/rmyndharis/OpenWA), unmodified upstream |
 | `bridge/`                               | The Python service — the part you talk to                           |
-| `.env`                                  | The only file you configure — six settings                          |
+| `.env`                                  | The only file you configure — four settings                          |
 | `start.sh` / `start.ps1`                | Sets up and starts everything — Linux / Windows                     |
 | `install-service.sh`                    | Registers both as systemd services (Linux)                          |
 | `data/media/`                           | Photos, voice notes and documents, by date. Not in git.             |
@@ -68,10 +67,9 @@ cd green-ring
 ### Both scripts do the same thing
 
 They check for **Node 22+**, **Python 3.10+** and a browser, and install whatever is missing — apt
-and NodeSource on Linux, winget on Windows. Then they ask three questions: your MongoDB URI, the
-queue URL to poll (blank to skip), and its bearer token. From those they write `.env`, install
-dependencies, build, and start both processes — printing your `BRIDGE_API_KEY`, the token you send
-from Postman.
+and NodeSource on Linux, winget on Windows. Then they ask one question — your MongoDB URI — and from
+that write `.env`, install dependencies, build, and start both processes, printing your
+`BRIDGE_API_KEY`, the token you send from Postman.
 
 If `MONGO_URI` points at this machine and nothing is listening there, Windows offers to install
 MongoDB; Linux tells you where to get it. A remote or Atlas URI is left alone either way — that's
@@ -102,12 +100,6 @@ curl http://localhost:8000/health
 
 Every run after the first is just the same start script — it skips setup, install and build when
 they are already done.
-
-### The queue is not part of this
-
-The Cloudflare Worker that holds queued messages is deployed separately and keeps running on its
-own — a fresh clone of this repo neither installs nor touches it. All this side needs is `POLL_URL`
-and `POLL_TOKEN` pointing at it.
 
 ---
 
@@ -165,121 +157,6 @@ missing or wrong token, `400` a bad number or a session that is not ready, `422`
 
 ---
 
-## Sending from anywhere: the pull model
-
-`POST /send` needs this machine to be reachable. Polling does not — the bridge dials **out**, so a PC
-anywhere can queue a message on your server and it goes out from here with no tunnel, no open port
-and nothing routable about this desktop.
-
-```
-  any PC ──POST {id,msg}──► your server ◄──GET every 3s── bridge ──► WhatsApp
-                              (queue)      returns and
-                                           forgets the message
-```
-
-Set `POLL_URL` in `.env` and it starts. One URL, two verbs: `POST` queues a message, `GET`
-asks "anything waiting to go out?".
-
-What a poll response may return:
-
-```json
-{ "id": "919876543210", "msg": "Hello", "_id": "queue-42" }
-```
-
-- **`id` is the destination.** `msg` is the text (`message`/`text`/`content`/`body`/`reply` also work),
-  and `to`/`number`/`phone`/`chatId` also name the destination.
-- **`_id` is the dedup key** — also `message_id`/`messageId`/`external_id`/`uid`. Optional but worth
-  sending.
-- An **array** sends every message in it, not just the first.
-- An **empty body** or `{}` means nothing is waiting.
-
-### Nothing without a recipient is ever sent
-
-One rule closes off a whole family of accidents: **a poll response can only produce a message if it
-names who the message is for.** No destination, nothing sent — no exceptions, no default, no way to
-configure one.
-
-It matters because a status body looks exactly like a message. `{"success":true,"message":"No
-messages"}` has a `message` field, and without this rule the bridge would send a stranger the words
-*"No messages"*. The same goes for `{"success":true,"message":"Message sent"}`, an error body, a bare
-JSON string, and an HTML login page served where an API was expected — each is refused, and each is
-logged saying why.
-
-Refusing an envelope never means losing what it wraps: a real message nested inside one
-(`{"success":true,"message":"OK","data":{"id":"91…","msg":"the real one"}}`) is still found and sent.
-
-There used to be a `POLL_DEFAULT_ID` setting that supplied a recipient when the payload named none —
-a leftover from the per-chat model. It was the only route by which a status envelope could reach a
-real person, so it is gone.
-
-### `id` means destination here — a deliberate break from winspark
-
-In the system this replaces, `id` in the poll response was the *dedup key*
-(`external_id = obj.get("id")`), and the destination came from which per-chat URL was polled. Now
-that one URL serves every chat, `id` has to carry the recipient instead — so the dedup key was moved
-to `_id` and friends, and `id` is **never** read as an identity. Had it stayed, the first message to a
-number would send and every later message to that same number would be silently dropped as a
-duplicate.
-
-### Deduplication
-
-1. **An explicit message id is authoritative** — seen before, skipped, permanently. The record lives
-   in MongoDB (`poll_claims`), so a restart does not resend a backlog.
-2. **Without one, only a consecutive repeat is suppressed** — the same text to the same chat twice in
-   a row.
-3. **An endpoint that has ever answered empty is exempt from rule 2**, because answering empty proves
-   it dequeues, and a dequeuing endpoint never offers the same message twice.
-
-Rule 3 exists because rule 2 does real damage to a dequeuing endpoint: suppressing a message there
-does not defer it, it **destroys** it — the endpoint already dropped it from its queue to hand it
-over. For the same reason the bridge **does not poll at all while the session is not `ready`**, and a
-send that fails after a message was handed over is written to MongoDB with `status: "failed"` rather
-than lost.
-
-### The queue — deployed and live
-
-A Hono + TypeScript Cloudflare Worker, **deployed and live** as `whatsapp-webhook-api`, serving both
-verbs on `/wam`: `POST` queues a message, `GET` hands one over and marks it delivered. Messages wait
-in a D1 database called `wa-queue`. Auth is its `API_TOKEN` secret, which matches `POLL_TOKEN` in
-`.env`.
-
-> **Its source is not in this repo** — it was removed in `ca7b0d9`. The deployed Worker keeps
-> running regardless, but there is currently nothing to rebuild it from if it needs changing.
-
-```
-https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam
-```
-
-Two details in the `GET` half matter. It **dequeues** — a row goes out once, then is marked
-delivered; an endpoint that re-served the same row would make the bridge send it forever. And when
-nothing is waiting it returns an **empty body (204)**, never a status envelope, for the reason in
-*Nothing without a recipient is ever sent* above.
-
-It uses D1 rather than KV on purpose — KV is eventually consistent, so two polls seconds apart can
-both read the same pending row and send the message twice. The claim is
-`UPDATE … WHERE delivered_at IS NULL`; a losing racer hands over nothing.
-
-Queue a message from any PC:
-
-```bash
-curl -X POST https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam   -H "Authorization: Bearer <API_TOKEN>"   -H "Content-Type: application/json"   -d '{"id":"919876543210","msg":"Hello"}'
-```
-
-On Windows PowerShell that same call needs `curl.exe --%` and backslash-escaped quotes — PowerShell
-mangles both otherwise:
-
-```powershell
-curl.exe --% -X POST https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam -H "Authorization: Bearer <API_TOKEN>" -H "Content-Type: application/json" -d "{\"id\":\"919876543210\",\"msg\":\"Hello\"}"
-```
-
-Answers `202 {"success":true,"message":"Message queued","data":{"id":"…"}}`, and the message goes out
-within a poll interval.
-
-Your own server works just as well — the Worker is only one implementation of the two verbs. Point
-`POLL_URL` anywhere that honours the contract above.
-
----
-
 ## What lands in MongoDB
 
 Database `openwa`, collection `messages`. One document per WhatsApp message, both directions:
@@ -306,8 +183,8 @@ Database `openwa`, collection `messages`. One document per WhatsApp message, bot
   or becomes `failed` / `revoked` / `edited`.
 - **Messages you type on the phone itself are captured too**, so the archive is the whole
   conversation, not just API traffic.
-- `source` is `api` (from `/send`), `poll` (collected from your queue), or `webhook` (seen by the
-  engine — including messages you typed on your own phone).
+- `source` is `api` (from `/send`) or `webhook` (seen by the engine — including messages you typed
+  on your own phone).
 - **`contactName` and `contactNumber`** are the other party, pulled out as top-level fields so you
   can query and index them. The name prefers your saved contact name over `pushName`, which is
   whatever they call themselves this week. The number falls back through the contact record, the
@@ -339,22 +216,19 @@ Database `openwa`, collection `messages`. One document per WhatsApp message, bot
 
 ## Configuration
 
-One file, `.env` at the root, holding the six settings that have no usable default. Everything else
+One file, `.env` at the root, holding the four settings that have no usable default. Everything else
 falls back to a working default and only belongs in the file if you are changing it — `.env.example`
 lists the full set, commented.
 
 | Setting          | Note                                                                                  |
 | ---------------- | ------------------------------------------------------------------------------------- |
 | `MONGO_URI`      | Currently the **local MongoDB service** on this machine, verified working. Change it to archive elsewhere. |
-| `POLL_URL`       | Your queue endpoint. Set to the deployed Worker — polling is on.                       |
-| `POLL_TOKEN`     | Bearer token sent with each poll. Matches the Worker's `API_TOKEN` secret.             |
 | `BRIDGE_API_KEY` | The bearer token Postman sends as `Authorization: Bearer <key>`.                       |
 | `OPENWA_API_KEY` | Shared with the gateway. Adopted from `repo/data/.api-key` when the gateway has already seeded one. |
 | `EVENTS_SECRET`  | Signs the gateway's internal event deliveries.                                         |
 
-Useful optional ones: `POLL_INTERVAL` (3s — raise it if your endpoint is on shared hosting),
-`MEDIA_ENABLED`, `MEDIA_DIR`, `MEDIA_MAX_BYTES` (25 MiB), `MEDIA_OUTBOUND` (off — your own sent
-media is a copy you already have), and `DEFAULT_COUNTRY_CODE`.
+Useful optional ones: `MEDIA_ENABLED`, `MEDIA_DIR`, `MEDIA_MAX_BYTES` (25 MiB), `MEDIA_OUTBOUND`
+(off — your own sent media is a copy you already have), and `DEFAULT_COUNTRY_CODE`.
 
 Both `.env` files hold secrets — keep them off GitHub (`bridge\.gitignore` covers its own).
 
@@ -433,7 +307,6 @@ bridge/.venv/bin/python bridge/scripts/selftest.py        # Linux
 bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py
 ```
 
-**106 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
+**77 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
 running: auth on both header styles, number parsing, the send path, every event branch, media
-detection and filenames, contact resolution, and the poll loop's parsing, dedup rules, refusals and
-failure handling.
+detection and filenames, and contact resolution.

@@ -50,16 +50,6 @@ class Settings(BaseSettings):
     openwa_session_name: str = "default"
     openwa_timeout: float = 30.0
 
-    # --- Outbound queue polling (bridge -> your server, pull model) ---------
-    # The bridge GETs this URL every POLL_INTERVAL seconds and sends whatever
-    # comes back. Nothing connects inward, so a PC anywhere can queue a message
-    # on your server and it goes out from here without this machine being
-    # reachable. Empty disables polling entirely.
-    poll_url: str = ""
-    poll_token: str = ""  # sent as: Authorization: Bearer <token>
-    poll_interval: float = 3.0
-    poll_timeout: float = 15.0
-
     # --- Media ---------------------------------------------------------------
     # Photos, voice notes, documents and video are not in the webhook - only a
     # `hasMedia` flag. When this is on, the bridge fetches the bytes from the
@@ -117,14 +107,6 @@ class Settings(BaseSettings):
     @property
     def events_list(self) -> list[str]:
         return [e.strip() for e in self.events_subscribe.split(",") if e.strip()]
-
-    @property
-    def poll_enabled(self) -> bool:
-        return bool(self.poll_url.strip())
-
-    @property
-    def poll_bearer(self) -> str:
-        return self.poll_token.strip()
 
     @property
     def media_root(self) -> Path:

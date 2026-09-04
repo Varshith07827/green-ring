@@ -134,9 +134,6 @@ if (-not (Test-Path $rootEnv)) {
 
     $mongo = Read-Host "  MongoDB URI [mongodb://localhost:27017]"
     if (-not $mongo) { $mongo = "mongodb://localhost:27017" }
-    $pollUrl = Read-Host "  Queue URL to poll, blank to skip (e.g. https://<worker>.workers.dev/wam)"
-    $pollToken = ""
-    if ($pollUrl) { $pollToken = Read-Host "  Bearer token for that URL" }
 
     $bridgeKey = New-Secret 24
 
@@ -168,11 +165,6 @@ if (-not (Test-Path $rootEnv)) {
 # Where every message is archived, both directions.
 MONGO_URI=$mongo
 
-# The queue the bridge collects outgoing messages from, so you can send from
-# any machine. Leave both blank to turn that off and send only from this one.
-POLL_URL=$pollUrl
-POLL_TOKEN=$pollToken
-
 # --- Generated once - keep them secret, no need to change them -------------
 
 # What you send from Postman:  Authorization: Bearer <this>
@@ -190,7 +182,6 @@ EVENTS_SECRET=$(New-Secret 24)
 #
 #   BRIDGE_PORT=8000            the port Postman talks to
 #   BRIDGE_HOST=0.0.0.0         127.0.0.1 to refuse everything but this machine
-#   POLL_INTERVAL=3             seconds between queue checks
 #   DEFAULT_COUNTRY_CODE=       e.g. 91 to accept bare 10-digit numbers
 #   LOG_LEVEL=info              debug for more detail
 #   MONGO_DB=openwa             database name

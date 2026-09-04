@@ -160,9 +160,6 @@ if [[ ! -f "$ROOT_ENV" ]]; then
   step "First run - setting up configuration"
   read -rp "  MongoDB URI [mongodb://localhost:27017]: " MONGO
   MONGO="${MONGO:-mongodb://localhost:27017}"
-  read -rp "  Queue URL to poll, blank to skip: " POLL_URL
-  POLL_TOKEN=""
-  [[ -n "$POLL_URL" ]] && read -rp "  Bearer token for that URL: " POLL_TOKEN
 
   BRIDGE_KEY="$(rand 24)"
 
@@ -190,11 +187,6 @@ if [[ ! -f "$ROOT_ENV" ]]; then
 # Where every message is archived, both directions.
 MONGO_URI=$MONGO
 
-# The queue the bridge collects outgoing messages from, so you can send from
-# any machine. Leave both blank to turn that off.
-POLL_URL=$POLL_URL
-POLL_TOKEN=$POLL_TOKEN
-
 # --- Generated once - keep them secret, no need to change them -------------
 
 # What you send from Postman:  Authorization: Bearer <this>
@@ -211,7 +203,6 @@ EVENTS_SECRET=$(rand 24)
 #
 #   BRIDGE_PORT=8000            the port you POST to
 #   BRIDGE_HOST=0.0.0.0         127.0.0.1 to refuse everything but this machine
-#   POLL_INTERVAL=3             seconds between queue checks
 #   MEDIA_DIR=data/media        where photos and voice notes are written
 #   DEFAULT_COUNTRY_CODE=       e.g. 91 to accept bare 10-digit numbers
 EOF

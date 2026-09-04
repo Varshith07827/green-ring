@@ -164,7 +164,7 @@ class Store:
     async def claim_media(self, *, session_name: str, message_id: str) -> bool:
         """Take ownership of downloading this message's media, exactly once.
 
-        Same atomic-update guard as the poll claim: the gateway redelivers an
+        An atomic-update guard: the gateway redelivers an
         event it thinks failed, and without this the same photo would be fetched
         and written two or three times.
         """
@@ -185,23 +185,6 @@ class Store:
             {"sessionName": session_name, "messageId": message_id},
             {"$set": {"media": media, "updatedAt": utcnow()}},
         )
-
-    async def claim_polled(self, *, session_name: str, poll_message_id: str) -> bool:
-        """Take ownership of one polled message id, exactly once, ever.
-
-        The id is the document key, so the insert either succeeds or collides -
-        no read-then-write window. Kept in MongoDB rather than memory so a
-        restart does not resend whatever the endpoint still remembers.
-        """
-        try:
-            await self.client[self._db_name]["poll_claims"].insert_one(
-                {"_id": f"{session_name}:{poll_message_id}", "claimedAt": utcnow()}
-            )
-            return True
-        except PyMongoError as exc:
-            if "duplicate key" in str(exc).lower():
-                return False
-            raise
 
     async def record_event(self, payload: dict[str, Any], headers: dict[str, str]) -> None:
         """Keep the raw webhook envelope for auditing/debugging."""

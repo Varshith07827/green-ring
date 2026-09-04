@@ -20,7 +20,6 @@ from fastapi.responses import JSONResponse
 
 from . import media
 from . import messages as msg_map
-from . import poller
 from .config import get_settings
 from .db import Store, utcnow
 from .models import HealthResponse, SendRequest, SendResponse
@@ -50,7 +49,6 @@ openwa = OpenWAClient(
     settings.openwa_session_name,
     settings.openwa_timeout,
 )
-poll_client = poller.PollClient(settings.poll_bearer, settings.poll_timeout)
 
 # Media downloads run detached from the delivery that triggered them, so the
 # gateway is not kept waiting on a video. asyncio only holds weak references to
@@ -86,12 +84,6 @@ async def lifespan(app: FastAPI):
         except OpenWAError as exc:
             log.warning("could not register the event subscription yet (%s)", exc)
 
-    poll_task: asyncio.Task | None = None
-    if settings.poll_enabled:
-        poll_task = asyncio.create_task(_poll_loop())
-    else:
-        log.info("polling is off (POLL_URL is empty)")
-
     log.info(
         "bridge ready on %s:%s  session=%s  mongo=%s/%s",
         settings.bridge_host,
@@ -103,18 +95,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if poll_task is not None:
-            poll_task.cancel()
-            try:
-                await poll_task
-            except asyncio.CancelledError:
-                pass
         # Let media downloads in flight finish writing rather than leaving a
         # half-written file on disk with a path already recorded in MongoDB.
         if _background:
             log.info("waiting for %d media download(s) to finish", len(_background))
             await asyncio.wait(set(_background), timeout=30)
-        await poll_client.close()
         await openwa.close()
         await store.close()
 
@@ -242,38 +227,6 @@ async def send(payload: SendRequest) -> SendResponse:
         status=doc.get("status", "sent"),
         storedId=str(doc.get("_id")) if doc else None,
     )
-
-
-# --------------------------------------------------------------- sending ---
-
-
-async def _send_and_store(
-    chat_id: str,
-    text: str,
-    *,
-    source: str | None = None,
-    poll_message_id: str | None = None,
-) -> str | None:
-    """Send text through OpenWA and record it, the same way POST /send does."""
-    sent_at = utcnow()
-    result = await openwa.send_text(chat_id, text)
-    message_id = (result or {}).get("messageId")
-    await store.upsert_message(
-        session_name=settings.openwa_session_name,
-        message_id=message_id,
-        set_fields={
-            "direction": "out",
-            "chatId": chat_id,
-            "phone": phone_of(chat_id),
-            "body": text,
-            "type": "text",
-            "fromMe": True,
-            "source": source or "api",
-            "pollMessageId": poll_message_id or None,
-        },
-        on_insert={"status": "sent", "timestamp": sent_at},
-    )
-    return message_id
 
 
 # ----------------------------------------------------------------- media ---
@@ -421,180 +374,6 @@ def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
     _background.add(task)
     task.add_done_callback(_background.discard)
-
-
-# ------------------------------------------------------------------ poll ---
-
-# An unpaired session never becomes ready on its own, so the readiness check
-# below would run at the poll interval forever. At three seconds that is 1200
-# calls an hour against a gateway that allows 1000, and once the hourly bucket
-# empties every call returns 429 - including the one that would have noticed
-# the session had finally been paired. The loop locks itself out. Re-check on
-# a widening interval instead: quick enough to pick up a pairing promptly,
-# slow enough that it cannot exhaust the budget.
-READY_CHECK_MIN = 5.0
-READY_CHECK_MAX = 120.0
-
-
-class _PollState:
-    """What the loop has to remember between polls.
-
-    `last_text` backs dedup rule 2 and `endpoint_dequeues` retires it - see
-    poller.py for why suppressing a message from a dequeuing endpoint destroys
-    it rather than deferring it.
-    """
-
-    def __init__(self) -> None:
-        self.last_text: dict[str, str] = {}
-        self.endpoint_dequeues = False
-        self.session_ready = False
-        # When the session is not ready the readiness check is the only thing
-        # this loop does, and at the poll interval it becomes the busiest
-        # caller the gateway has. Back off instead - see _poll_once.
-        self.ready_check_after = 0.0
-        self.ready_backoff = READY_CHECK_MIN
-
-
-poll_state = _PollState()
-
-
-async def _session_is_ready() -> bool:
-    try:
-        info = await openwa.session_info()
-    except OpenWAError as exc:
-        if exc.status == 429:
-            log.warning(
-                "poll: the gateway is rate-limiting the readiness check; backing off"
-            )
-        else:
-            log.debug("poll: cannot read session status (%s)", exc)
-        return False
-    return info.get("status") == "ready"
-
-
-async def _deliver_polled(item: poller.Outgoing) -> None:
-    """Send one polled message, recording it whatever happens.
-
-    A dequeuing endpoint has already given the message up by the time we see it,
-    so a failure here loses it unless it is written down. It is written down.
-    """
-    try:
-        chat_id = to_chat_id(item.dest, settings.default_country_code)
-    except InvalidNumber as exc:
-        log.error("poll: cannot address %r (%s) - message dropped: %r", item.dest, exc, item.text[:60])
-        await store.upsert_message(
-            session_name=settings.openwa_session_name,
-            message_id=None,
-            set_fields={
-                "direction": "out",
-                "body": item.text,
-                "type": "text",
-                "fromMe": True,
-                "status": "failed",
-                "error": f"unusable destination {item.dest!r}: {exc}",
-                "timestamp": utcnow(),
-                "source": "poll",
-                "pollMessageId": item.message_id or None,
-            },
-        )
-        return
-
-    text = item.text[:MAX_TEXT]
-    try:
-        await _send_and_store(chat_id, text, source="poll", poll_message_id=item.message_id)
-    except OpenWAError as exc:
-        log.error("poll: send to %s failed - message lost from the queue: %s", chat_id, exc)
-        await store.upsert_message(
-            session_name=settings.openwa_session_name,
-            message_id=None,
-            set_fields={
-                "direction": "out",
-                "chatId": chat_id,
-                "phone": phone_of(chat_id),
-                "body": text,
-                "type": "text",
-                "fromMe": True,
-                "status": "failed",
-                "error": str(exc),
-                "timestamp": utcnow(),
-                "source": "poll",
-                "pollMessageId": item.message_id or None,
-            },
-        )
-        return
-
-    poll_state.last_text[chat_id] = text
-    log.info("poll -> sent to %s: %r", chat_id, text[:60])
-
-
-async def _poll_once() -> None:
-    # Never dequeue what cannot be delivered. An endpoint hands a message over
-    # by removing it from its queue, so polling while the session is down would
-    # destroy messages rather than defer them.
-    if not poll_state.session_ready:
-        now = time.monotonic()
-        if now < poll_state.ready_check_after:
-            return
-        poll_state.session_ready = await _session_is_ready()
-        if not poll_state.session_ready:
-            poll_state.ready_check_after = now + poll_state.ready_backoff
-            log.debug(
-                "poll: skipped, session is not ready (next check in %.0fs)",
-                poll_state.ready_backoff,
-            )
-            poll_state.ready_backoff = min(poll_state.ready_backoff * 2, READY_CHECK_MAX)
-            return
-        poll_state.ready_backoff = READY_CHECK_MIN
-
-    result = await poll_client.poll(settings.poll_url)
-
-    if not result.ok:
-        log.warning("poll failed: %s", result.error)
-        # A failure may mean the gateway went away too; re-check next time.
-        poll_state.session_ready = False
-        return
-
-    if result.is_empty:
-        # Proof the endpoint dequeues, which retires the consecutive-repeat rule.
-        if not poll_state.endpoint_dequeues:
-            log.info("poll: endpoint reported empty - repeat suppression disabled from here")
-        poll_state.endpoint_dequeues = True
-        return
-
-    for item in result.messages:
-        if item.message_id:
-            if not await store.claim_polled(
-                session_name=settings.openwa_session_name, poll_message_id=item.message_id
-            ):
-                log.debug("poll: already handled message id %s", item.message_id)
-                continue
-        elif not poll_state.endpoint_dequeues:
-            try:
-                chat_id = to_chat_id(item.dest, settings.default_country_code)
-            except InvalidNumber:
-                chat_id = item.dest
-            if poll_state.last_text.get(chat_id) == item.text:
-                log.debug("poll: suppressing an unchanged repeat for %s", chat_id)
-                continue
-
-        await _deliver_polled(item)
-
-
-async def _poll_loop() -> None:
-    log.info(
-        "polling %s every %ss for messages to send",
-        settings.poll_url,
-        settings.poll_interval,
-    )
-    while True:
-        await asyncio.sleep(settings.poll_interval)
-        try:
-            await _poll_once()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # A poll loop that dies takes the whole outbound path with it.
-            log.exception("poll: unhandled error, continuing")
 
 
 # --------------------------------------------------------------- webhook ---
