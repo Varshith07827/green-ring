@@ -11,6 +11,7 @@ import base64
 import binascii
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -424,6 +425,16 @@ def _spawn(coro) -> None:
 
 # ------------------------------------------------------------------ poll ---
 
+# An unpaired session never becomes ready on its own, so the readiness check
+# below would run at the poll interval forever. At three seconds that is 1200
+# calls an hour against a gateway that allows 1000, and once the hourly bucket
+# empties every call returns 429 - including the one that would have noticed
+# the session had finally been paired. The loop locks itself out. Re-check on
+# a widening interval instead: quick enough to pick up a pairing promptly,
+# slow enough that it cannot exhaust the budget.
+READY_CHECK_MIN = 5.0
+READY_CHECK_MAX = 120.0
+
 
 class _PollState:
     """What the loop has to remember between polls.
@@ -437,6 +448,11 @@ class _PollState:
         self.last_text: dict[str, str] = {}
         self.endpoint_dequeues = False
         self.session_ready = False
+        # When the session is not ready the readiness check is the only thing
+        # this loop does, and at the poll interval it becomes the busiest
+        # caller the gateway has. Back off instead - see _poll_once.
+        self.ready_check_after = 0.0
+        self.ready_backoff = READY_CHECK_MIN
 
 
 poll_state = _PollState()
@@ -446,7 +462,12 @@ async def _session_is_ready() -> bool:
     try:
         info = await openwa.session_info()
     except OpenWAError as exc:
-        log.debug("poll: cannot read session status (%s)", exc)
+        if exc.status == 429:
+            log.warning(
+                "poll: the gateway is rate-limiting the readiness check; backing off"
+            )
+        else:
+            log.debug("poll: cannot read session status (%s)", exc)
         return False
     return info.get("status") == "ready"
 
@@ -511,10 +532,19 @@ async def _poll_once() -> None:
     # by removing it from its queue, so polling while the session is down would
     # destroy messages rather than defer them.
     if not poll_state.session_ready:
+        now = time.monotonic()
+        if now < poll_state.ready_check_after:
+            return
         poll_state.session_ready = await _session_is_ready()
         if not poll_state.session_ready:
-            log.debug("poll: skipped, session is not ready")
+            poll_state.ready_check_after = now + poll_state.ready_backoff
+            log.debug(
+                "poll: skipped, session is not ready (next check in %.0fs)",
+                poll_state.ready_backoff,
+            )
+            poll_state.ready_backoff = min(poll_state.ready_backoff * 2, READY_CHECK_MAX)
             return
+        poll_state.ready_backoff = READY_CHECK_MIN
 
     result = await poll_client.poll(settings.poll_url)
 
