@@ -115,23 +115,66 @@ class OpenWAClient:
 
     # -- messages -----------------------------------------------------------
 
-    async def send_text(self, chat_id: str, text: str) -> dict:
+    async def _post_message(self, endpoint: str, payload: dict) -> dict:
+        """POST to one of the session's message endpoints, surviving a recreated session."""
         session_id = await self.session_id()
-        payload = {"chatId": chat_id, "text": text}
+        path = f"/api/sessions/{session_id}/messages/{endpoint}"
         try:
-            return await self._request(
-                "POST", f"/api/sessions/{session_id}/messages/send-text", json=payload
-            )
+            return await self._request("POST", path, json=payload)
         except OpenWAError as exc:
             # A stale cached session id (session recreated) resolves on retry.
             if exc.status == 404:
                 await self.session_id(refresh=True)
                 return await self._request(
                     "POST",
-                    f"/api/sessions/{await self.session_id()}/messages/send-text",
+                    f"/api/sessions/{await self.session_id()}/messages/{endpoint}",
                     json=payload,
                 )
             raise
+
+    async def send_text(self, chat_id: str, text: str) -> dict:
+        return await self._post_message("send-text", {"chatId": chat_id, "text": text})
+
+    async def send_media(
+        self,
+        kind: str,
+        chat_id: str,
+        *,
+        url: str | None = None,
+        data_base64: str | None = None,
+        mimetype: str | None = None,
+        filename: str | None = None,
+        caption: str | None = None,
+        ptt: bool = False,
+    ) -> dict:
+        """Send one file as `kind` - image, video, audio, document or sticker.
+
+        Exactly one of `url` (the gateway fetches it) or `data_base64` (we send
+        the bytes) carries the file. The gateway prefers base64 when both are
+        present, so passing both is a way to send something other than what you
+        meant; callers pick one.
+        """
+        payload: dict[str, Any] = {"chatId": chat_id}
+        if data_base64:
+            payload["base64"] = data_base64
+            # The gateway documents mimetype as required alongside base64: with
+            # no type it cannot choose a container and the send fails.
+            payload["mimetype"] = mimetype or "application/octet-stream"
+        elif url:
+            payload["url"] = url
+            if mimetype:
+                payload["mimetype"] = mimetype
+        else:
+            raise OpenWAError("send_media needs either url or data_base64")
+
+        if filename:
+            payload["filename"] = filename
+        if caption:
+            payload["caption"] = caption
+        if kind == "audio" and ptt:
+            payload["ptt"] = True
+
+        return await self._post_message(f"send-{kind}", payload)
 
     async def contact_phone(self, contact_id: str) -> str | None:
         """Resolve a privacy id (`@lid`) to a phone number, best-effort.

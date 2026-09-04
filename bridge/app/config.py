@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     # Skip anything larger. The gateway has its own cap (50 MiB by default);
     # this one bounds what lands on your disk.
     media_max_bytes: int = 25 * 1024 * 1024
+    # An uploaded file is base64'd into the gateway's JSON body, which it caps
+    # at 25 MB. Measured on the *encoded* length, since that is what travels.
+    send_max_encoded_bytes: int = 24 * 1024 * 1024
     # Media you send counts too. A photo composed on the linked phone is NOT a
     # copy the bridge already holds - only API sends are - so leaving this off
     # loses every picture you take and send yourself.

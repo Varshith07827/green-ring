@@ -16,7 +16,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from . import media
 from . import messages as msg_map
@@ -137,6 +139,13 @@ async def root() -> dict[str, Any]:
                 "Content-Type": "application/json",
             },
             "body": {"id": "919876543210", "msg": "your message"},
+            "media": {
+                "byUrl": {"id": "919876543210", "msg": "caption", "media": "https://host/photo.jpg"},
+                "byUpload": "multipart/form-data with fields id, msg and file",
+                "types": ["image", "video", "audio", "voice", "document", "sticker"],
+                "note": "the type is derived from the file's mimetype unless you set `type`",
+            },
+            "groups": "put the group jid (120363...@g.us) in `id`",
         },
         "docs": "/docs",
     }
@@ -171,34 +180,169 @@ async def health() -> HealthResponse:
 # ------------------------------------------------------------------ send ---
 
 
-@app.post("/send", response_model=SendResponse, dependencies=[Depends(require_api_key)])
-async def send(payload: SendRequest) -> SendResponse:
+MULTIPART = "multipart/form-data"
+URLENCODED = "application/x-www-form-urlencoded"
+# Both of Postman's form tabs, not just the one that can carry a file: someone
+# filling in id and msg as fields has picked a form body, and answering "Body is
+# not valid JSON" to that is technically true and no help at all.
+FORM_TYPES = (MULTIPART, URLENCODED)
+
+# Documented by hand because the route takes a raw Request: one path accepts
+# either a JSON body or a multipart upload, and FastAPI can only infer one.
+SEND_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "example": "919876543210"},
+                        "msg": {"type": "string", "example": "Hello from Postman"},
+                        "media": {
+                            "type": "string",
+                            "description": "http(s) URL, data: URI, or raw base64",
+                            "example": "https://example.com/photo.jpg",
+                        },
+                        "filename": {"type": "string"},
+                        "mimetype": {"type": "string"},
+                        "type": {
+                            "type": "string",
+                            "enum": ["image", "video", "audio", "voice", "document", "sticker"],
+                        },
+                    },
+                }
+            },
+            MULTIPART: {
+                "schema": {
+                    "type": "object",
+                    "required": ["id", "file"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "msg": {"type": "string", "description": "Caption"},
+                        "file": {"type": "string", "format": "binary"},
+                        "filename": {"type": "string"},
+                        "mimetype": {"type": "string"},
+                        "type": {"type": "string"},
+                    },
+                }
+            },
+        },
+    }
+}
+
+UPLOAD_FIELDS = ("file", "media", "upload", "attachment")
+
+
+def _kind_and_ptt(
+    requested: str | None, mimetype: str | None, filename: str | None
+) -> tuple[str, bool]:
+    """Which send-* endpoint to use, and whether audio goes as a voice note.
+
+    "voice" is not an endpoint of its own - it is send-audio with ptt set, the
+    difference between a file bubble and a mic bubble with a waveform.
+    """
+    if requested:
+        wanted = requested.strip().lower()
+        return ("audio", True) if wanted == "voice" else (wanted, False)
+    return media.kind_for(mimetype, filename), False
+
+
+async def _read_form(
+    request: Request,
+) -> tuple[dict[str, Any], bytes | None, str | None, str | None]:
+    """Split a form body into its plain fields and the one attached file, if any."""
+    form = await request.form()
+    fields: dict[str, Any] = {}
+    upload = None
+    for key, value in form.multi_items():
+        if getattr(value, "filename", None):
+            if upload is None and key in UPLOAD_FIELDS:
+                upload = value
+        else:
+            fields.setdefault(key, value)
+    if upload is None:
+        return fields, None, None, None
+    return fields, await upload.read(), upload.filename or None, upload.content_type or None
+
+
+def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
+    """Pydantic errors, shaped so FastAPI's 422 body can be serialised.
+
+    `ctx` carries the original exception object, which the JSON encoder cannot
+    render, and the docs `url` is noise in an API response.
+    """
+    return [
+        {k: v for k, v in error.items() if k not in ("ctx", "url")}
+        for error in exc.errors()
+    ]
+
+
+@app.post(
+    "/send",
+    response_model=SendResponse,
+    dependencies=[Depends(require_api_key)],
+    openapi_extra=SEND_OPENAPI,
+)
+async def send(request: Request) -> SendResponse:
+    """Send text, or a file, to any chat.
+
+    JSON carries text and media that is already hosted; multipart carries a file
+    from the machine making the call.
+    """
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+
+    upload_bytes: bytes | None = None
+    upload_name: str | None = None
+    upload_type: str | None = None
+
+    if content_type in FORM_TYPES:
+        raw, upload_bytes, upload_name, upload_type = await _read_form(request)
+    else:
+        try:
+            raw = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Body is not valid JSON.")
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object.")
+
+    try:
+        payload = SendRequest.model_validate(raw)
+    except ValidationError as exc:
+        # The body is parsed by hand here (one path takes JSON or multipart), so
+        # nothing has already turned a pydantic failure into a response. Without
+        # this it escapes as a 500 and the caller is told the server broke when
+        # it was their caption that was too long.
+        raise RequestValidationError(_validation_details(exc)) from exc
+
+    # The one rule the model cannot enforce: it never sees the uploaded file, so
+    # "is there anything to send here" has to be answered where the file is.
+    has_text = bool(payload.msg and payload.msg.strip())
+    if not has_text and not payload.media and upload_bytes is None:
+        # 422, not 400: this is a body that does not satisfy the schema, which
+        # is what every other malformed-body rejection here already returns.
+        raise HTTPException(
+            status_code=422,
+            detail="Nothing to send: provide msg (text), media (a URL or base64), or a file.",
+        )
+
     try:
         chat_id = to_chat_id(payload.id, settings.default_country_code)
     except InvalidNumber as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if upload_bytes is None and not payload.media:
+        return await _send_text(chat_id, payload.msg or "")
+    return await _send_media(chat_id, payload, upload_bytes, upload_name, upload_type)
+
+
+async def _send_text(chat_id: str, text: str) -> SendResponse:
     sent_at = utcnow()
     try:
-        result = await openwa.send_text(chat_id, payload.msg)
+        result = await openwa.send_text(chat_id, text)
     except OpenWAError as exc:
-        # Record the attempt so a failed send is not invisible in Mongo.
-        await store.upsert_message(
-            session_name=settings.openwa_session_name,
-            message_id=None,
-            set_fields={
-                "direction": "out",
-                "chatId": chat_id,
-                "phone": phone_of(chat_id),
-                "body": payload.msg,
-                "type": "text",
-                "fromMe": True,
-                "status": "failed",
-                "error": str(exc),
-                "timestamp": sent_at,
-                "source": "api",
-            },
-        )
+        await _record_failure(chat_id, body=text, kind="text", error=exc, when=sent_at)
         raise
 
     message_id = (result or {}).get("messageId")
@@ -209,7 +353,7 @@ async def send(payload: SendRequest) -> SendResponse:
             "direction": "out",
             "chatId": chat_id,
             "phone": phone_of(chat_id),
-            "body": payload.msg,
+            "body": text,
             "type": "text",
             "fromMe": True,
             "source": "api",
@@ -218,7 +362,6 @@ async def send(payload: SendRequest) -> SendResponse:
         # and timestamp are insert-only: never clobber what the engine reported.
         on_insert={"status": "sent", "timestamp": sent_at},
     )
-
     log.info("sent -> %s (%s)", chat_id, message_id)
     return SendResponse(
         ok=True,
@@ -226,8 +369,136 @@ async def send(payload: SendRequest) -> SendResponse:
         chatId=chat_id,
         status=doc.get("status", "sent"),
         storedId=str(doc.get("_id")) if doc else None,
+        type="text",
     )
 
+
+async def _send_media(
+    chat_id: str,
+    payload: SendRequest,
+    upload_bytes: bytes | None,
+    upload_name: str | None,
+    upload_type: str | None,
+) -> SendResponse:
+    if upload_bytes is not None:
+        ref = media.MediaRef(
+            data_base64=base64.b64encode(upload_bytes).decode("ascii"),
+            mimetype=upload_type,
+            filename=upload_name,
+        )
+        content: bytes | None = upload_bytes
+    else:
+        try:
+            ref = media.parse_media_ref(payload.media or "")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        content = None
+        if ref.data_base64:
+            try:
+                content = base64.b64decode(ref.data_base64, validate=True)
+            except (binascii.Error, ValueError):
+                content = None
+
+    filename = payload.filename or ref.filename
+    mimetype = payload.mimetype or ref.mimetype or media.guess_mimetype(filename)
+    kind, ptt = _kind_and_ptt(payload.type, mimetype, filename)
+    caption = payload.msg or None
+
+    # Bytes we hold travel base64-encoded, which inflates them by a third. Check
+    # the encoded length against the gateway's body cap here, where the limit can
+    # be named, rather than letting it answer with a bare 413 that says nothing
+    # about which field was too big.
+    encoded_len = len(ref.data_base64 or "")
+    if encoded_len > settings.send_max_encoded_bytes:
+        allowed_mib = settings.send_max_encoded_bytes * 3 // 4 // (1024 * 1024)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"that file is too large to upload (about {allowed_mib} MiB is the most "
+                "the gateway accepts once base64-encoded). Host it somewhere and pass "
+                "its URL as `media` instead."
+            ),
+        )
+
+    sent_at = utcnow()
+    try:
+        result = await openwa.send_media(
+            kind,
+            chat_id,
+            url=ref.url,
+            data_base64=ref.data_base64,
+            mimetype=mimetype,
+            filename=filename,
+            caption=caption,
+            ptt=ptt,
+        )
+    except OpenWAError as exc:
+        await _record_failure(chat_id, body=caption or "", kind=kind, error=exc, when=sent_at)
+        raise
+
+    message_id = (result or {}).get("messageId")
+    doc = await store.upsert_message(
+        session_name=settings.openwa_session_name,
+        message_id=message_id,
+        set_fields={
+            "direction": "out",
+            "chatId": chat_id,
+            "phone": phone_of(chat_id),
+            "body": caption or "",
+            "type": kind,
+            "fromMe": True,
+            "hasMedia": True,
+            "source": "api",
+            "mediaInfo": {
+                "mimetype": mimetype,
+                "filename": filename,
+                "sourceUrl": ref.url,
+                "sizeBytes": len(content) if content is not None else None,
+            },
+        },
+        on_insert={"status": "sent", "timestamp": sent_at},
+    )
+
+    # Archive only what we already hold. A URL send is fetched by the gateway, so
+    # those bytes never pass through here, and downloading them again purely to
+    # file a copy would double the transfer for something already hosted -
+    # mediaInfo.sourceUrl records where it came from instead.
+    saved_path = None
+    if content is not None and message_id and settings.media_enabled:
+        saved_path = await _write_media(message_id, phone_of(chat_id), content, mimetype, filename)
+
+    log.info("sent %s -> %s (%s)", kind, chat_id, message_id)
+    return SendResponse(
+        ok=True,
+        messageId=message_id,
+        chatId=chat_id,
+        status=doc.get("status", "sent"),
+        storedId=str(doc.get("_id")) if doc else None,
+        type=kind,
+        mediaPath=saved_path,
+    )
+
+
+async def _record_failure(
+    chat_id: str, *, body: str, kind: str, error: Exception, when: Any
+) -> None:
+    """Record an attempt the gateway refused, so a failed send is not invisible."""
+    await store.upsert_message(
+        session_name=settings.openwa_session_name,
+        message_id=None,
+        set_fields={
+            "direction": "out",
+            "chatId": chat_id,
+            "phone": phone_of(chat_id),
+            "body": body,
+            "type": kind,
+            "fromMe": True,
+            "status": "failed",
+            "error": str(error),
+            "timestamp": when,
+            "source": "api",
+        },
+    )
 
 # ----------------------------------------------------------------- media ---
 
@@ -292,8 +563,11 @@ async def _write_media(
     content: bytes,
     mimetype: str,
     filename: str | None,
-) -> None:
-    """Write the bytes to disk and record the result on the message."""
+) -> str | None:
+    """Write the bytes to disk and record the result on the message.
+
+    Returns the stored path, or None when nothing was written.
+    """
     session_name = settings.openwa_session_name
 
     if len(content) > settings.media_max_bytes:
@@ -313,7 +587,7 @@ async def _write_media(
                 "savedAt": utcnow(),
             },
         )
-        return
+        return None
 
     root = settings.media_root
     saved = await asyncio.to_thread(
@@ -329,6 +603,7 @@ async def _write_media(
         session_name=session_name, message_id=message_id, media=saved.as_document(root)
     )
     log.info("media saved: %s (%s, %d bytes)", saved.path, saved.mimetype, saved.size_bytes)
+    return saved.path
 
 
 async def _enrich(

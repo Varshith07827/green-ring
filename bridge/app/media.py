@@ -18,6 +18,8 @@ sanitised - a raw WhatsApp id (`true_919...@c.us_3EB0`) contains characters
 Windows will not accept in a filename.
 """
 
+import base64
+import binascii
 import hashlib
 import logging
 import mimetypes
@@ -26,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 log = logging.getLogger("bridge.media")
 
@@ -74,6 +77,93 @@ class SavedMedia:
             "sizeBytes": self.size_bytes,
             "savedAt": datetime.now(timezone.utc),
         }
+
+
+# Which gateway endpoint sends a given file. WhatsApp treats these as different
+# message types, not as one "attachment" with a MIME label: an image gets a
+# preview bubble, a document gets a filename and a download icon. Sending a
+# photo as a document technically works and looks wrong to the person reading
+# it, so the mimetype picks the endpoint and anything unrecognised becomes a
+# document - the one type that renders acceptably for arbitrary bytes.
+@dataclass
+class MediaRef:
+    """Where the bytes for an outbound send come from."""
+
+    url: str | None = None
+    data_base64: str | None = None
+    mimetype: str | None = None
+    filename: str | None = None
+
+
+DATA_URI = re.compile(r"^data:([^;,]*)(;[^,]*)?,", re.I)
+
+
+def parse_media_ref(value: str) -> MediaRef:
+    """Work out what the caller put in `media`.
+
+    Three shapes are accepted because all three turn up in practice: a URL for
+    something already hosted, a `data:` URI for what a browser hands you, and
+    bare base64 for everything else. Any other scheme is refused rather than
+    passed along - `file:///etc/passwd` reaching the gateway would ask it to
+    read its own disk and send the result to a stranger.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("media is empty")
+
+    lowered = raw.lower()
+    if lowered.startswith(("http://", "https://")):
+        name = unquote(urlparse(raw).path.rsplit("/", 1)[-1]) or None
+        guessed, _ = mimetypes.guess_type(name) if name else (None, None)
+        return MediaRef(url=raw, filename=name, mimetype=guessed)
+
+    match = DATA_URI.match(raw)
+    if match:
+        if ";base64" not in (match.group(2) or "").lower():
+            raise ValueError("a data: URI must be base64-encoded")
+        return MediaRef(
+            data_base64=raw[match.end():].strip(),
+            mimetype=(match.group(1) or "").strip() or None,
+        )
+
+    if "://" in raw[:24]:
+        scheme = raw.split("://", 1)[0]
+        raise ValueError(f"media must be an http(s) URL, a data: URI or base64 - not {scheme}://")
+
+    # Bare base64. Validate now: the gateway would otherwise answer with its own
+    # decoder's error, which says nothing about which field was wrong.
+    try:
+        base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"media is not a URL, a data: URI, or valid base64 ({exc})") from exc
+    return MediaRef(data_base64=raw)
+
+
+def kind_for(mimetype: str | None, filename: str | None = None) -> str:
+    base = (mimetype or "").split(";")[0].strip().lower()
+    if not base and filename:
+        guessed, _ = mimetypes.guess_type(filename)
+        base = (guessed or "").lower()
+    if base.startswith("image/"):
+        return "image"
+    if base.startswith("video/"):
+        return "video"
+    if base.startswith("audio/"):
+        return "audio"
+    return "document"
+
+
+def guess_mimetype(filename: str | None, fallback: str = "application/octet-stream") -> str:
+    """Best-effort mimetype from a filename, for uploads that arrive without one."""
+    if filename:
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed:
+            return guessed
+        suffix = Path(filename).suffix.lower()
+        for mime, ext in EXTENSIONS.items():
+            if ext == suffix:
+                return mime
+    return fallback
 
 
 def extension_for(mimetype: str, filename: str | None) -> str:

@@ -1,7 +1,7 @@
 # OpenWA Bridge
 
-Send a WhatsApp message by POSTing `{"id": "<phone>", "msg": "<text>"}` and archive every message,
-both directions, in MongoDB, with photos and voice notes written to disk.
+Send a WhatsApp message — text or a file — by POSTing `{"id": "<phone>", "msg": "<text>"}`, and
+archive every message, both directions, in MongoDB, with photos and voice notes written to disk.
 
 Runs natively on Linux or Windows. **No Docker.**
 
@@ -134,12 +134,68 @@ immediately.
 A number with no country code is **rejected**, so a message cannot silently go to the wrong country.
 Set `DEFAULT_COUNTRY_CODE=91` in `.env` to accept bare national numbers instead.
 
-**`msg`** is text, 1–4096 characters. `number`/`to`/`phone` and `message`/`text`/`body` are accepted
-as aliases.
+**`msg`** is text, up to 4096 characters — or the caption when you send a file, where WhatsApp's
+limit is 1024. `number`/`to`/`phone` and `message`/`text`/`body` are accepted as aliases.
+
+### Sending a file
+
+Two ways, same endpoint. **A URL**, when the file is already hosted — the gateway fetches it, so
+nothing large passes through the bridge:
+
+```json
+{ "id": "919876543210", "msg": "on the roof", "media": "https://example.com/photo.jpg" }
+```
+
+**An upload**, when the file is on the machine making the call — Postman's *form-data* tab, or:
+
+```bash
+curl -X POST http://localhost:8000/send \
+  -H "Authorization: Bearer $BRIDGE_API_KEY" \
+  -F id=919876543210 \
+  -F msg="from my laptop" \
+  -F file=@holiday.png
+```
+
+`media` also accepts a `data:` URI or raw base64, so a browser can post what it already holds.
+
+**You never pick an endpoint.** The mimetype decides which kind of WhatsApp message it becomes:
+
+| Mimetype        | Sent as    | Looks like                        |
+| --------------- | ---------- | --------------------------------- |
+| `image/*`       | image      | preview bubble                    |
+| `video/*`       | video      | player bubble                     |
+| `audio/*`       | audio      | file bubble with a play button    |
+| anything else   | document   | filename with a download icon     |
+
+Override it with `"type"` — `image`, `video`, `audio`, `voice`, `document` or `sticker`. `voice` is
+the one worth knowing: it sends audio as a **voice note**, the mic bubble with a waveform rather than
+a file attachment. Send `audio/ogg; codecs=opus` for reliable playback.
+
+The response names what was sent and where the copy landed:
+
+```json
+{
+  "ok": true,
+  "messageId": "true_919876543210@c.us_3EB0ABCD",
+  "chatId": "919876543210@c.us",
+  "status": "sent",
+  "type": "image",
+  "mediaPath": "2026/09/04/919876543210_MED7_a1b2c3d4e5.png"
+}
+```
+
+**Uploads are archived; URL sends are not.** When the bridge holds the bytes it writes them under
+`data/media/` and records the path, exactly as it does for received media. A URL send is fetched by
+the gateway and those bytes never pass through here — copying them would double the transfer for a
+file you already host — so `mediaPath` is `null` and `mediaInfo.sourceUrl` records where it came
+from instead.
+
+Uploads are capped near 24 MiB, measured *after* base64 encoding, which is what the gateway's
+25 MB body limit actually sees. Past that, host the file and send its URL.
 
 | Method | Path               | Auth  | Purpose                                                     |
 | ------ | ------------------ | ----- | ----------------------------------------------------------- |
-| `POST` | `/send`            | token | Send a message to any chat, by `id`                         |
+| `POST` | `/send`            | token | Send text or a file to any chat, by `id`                    |
 | `GET`  | `/health`          | —     | Mongo + gateway + session state                             |
 | `GET`  | `/messages`        | token | Recent messages from Mongo (`limit`, `chatId`, `direction`) |
 | `GET`  | `/session`         | token | Full session detail                                         |
@@ -147,8 +203,12 @@ as aliases.
 | `POST` | `/events/register` | token | Recreate the session + event subscription                   |
 | `GET`  | `/docs`            | —     | Swagger UI                                                  |
 
+`/send` takes JSON, `multipart/form-data` or a urlencoded form, on the same URL — whichever tab you
+picked in Postman works.
+
 Auth is `Authorization: Bearer <BRIDGE_API_KEY>` (`X-API-Key: <key>` is still accepted). `401` is a
-missing or wrong token, `400` a bad number or a session that is not ready, `422` a malformed body.
+missing or wrong token, `400` a bad number, an unusable `media` value, or a session that is not
+ready, `413` a file too large to upload, `422` a malformed body.
 
 > The bridge listens on `0.0.0.0:8000`, so anything that can route to this machine can reach it —
 > other PCs on the LAN, or the internet if a port is forwarded to it. From a machine that *cannot*
@@ -307,6 +367,7 @@ bridge/.venv/bin/python bridge/scripts/selftest.py        # Linux
 bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py
 ```
 
-**77 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
+**111 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
 running: auth on both header styles, number parsing, the send path, every event branch, media
-detection and filenames, and contact resolution.
+detection and filenames, contact resolution, media sending by URL and by upload, and number
+normalisation.

@@ -122,6 +122,7 @@ class FakeStore:
 class FakeOpenWA:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.media_sent: list[dict[str, Any]] = []
         self.fail_next = False
         self.counter = 0
 
@@ -144,6 +145,36 @@ class FakeOpenWA:
         self.counter += 1
         self.sent.append((chat_id, text))
         return {"messageId": f"true_{chat_id}_MSG{self.counter}"}
+
+    async def send_media(
+        self,
+        kind,
+        chat_id,
+        *,
+        url=None,
+        data_base64=None,
+        mimetype=None,
+        filename=None,
+        caption=None,
+        ptt=False,
+    ):
+        if self.fail_next:
+            self.fail_next = False
+            raise OpenWAError("session is not active", status=400)
+        self.counter += 1
+        self.media_sent.append(
+            {
+                "kind": kind,
+                "chatId": chat_id,
+                "url": url,
+                "base64": data_base64,
+                "mimetype": mimetype,
+                "filename": filename,
+                "caption": caption,
+                "ptt": ptt,
+            }
+        )
+        return {"messageId": f"true_{chat_id}_MED{self.counter}"}
 
     async def ensure_webhook(self, url, events, secret):
         return {"action": "created", "webhook": {"id": "wh-1", "url": url, "events": events}}
@@ -505,6 +536,181 @@ async def run() -> int:
             doc = saved.as_document(root)
             check("document carries a relative and an absolute path", bool(doc["path"]) and bool(doc["absolutePath"]))
             check("mimetype has no codec suffix", doc["mimetype"] == "image/jpeg", doc["mimetype"])
+
+        print("\n-- media sending --")
+
+        import base64 as _b64  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+
+        openwa.media_sent.clear()
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "msg": "on the roof", "media": "https://ex.com/a/roof.jpg"},
+            headers=key_header,
+        )
+        check("url send accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        last = openwa.media_sent[-1]
+        check("image endpoint chosen from the extension", last["kind"] == "image", last["kind"])
+        check("the url is passed through, not the bytes", last["url"] and not last["base64"])
+        check("msg becomes the caption", last["caption"] == "on the roof", str(last["caption"]))
+        check("response names the type", r.json()["type"] == "image", r.text[:80])
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://ex.com/clip.mp4"},
+            headers=key_header,
+        )
+        check("media with no caption is allowed", r.status_code == 200, f"got {r.status_code}")
+        check("video endpoint chosen", openwa.media_sent[-1]["kind"] == "video")
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://ex.com/photo.jpg", "type": "document"},
+            headers=key_header,
+        )
+        check("explicit type overrides the mimetype", openwa.media_sent[-1]["kind"] == "document")
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://ex.com/note.ogg", "type": "voice"},
+            headers=key_header,
+        )
+        check("voice sends as audio", openwa.media_sent[-1]["kind"] == "audio")
+        check("voice sets ptt", openwa.media_sent[-1]["ptt"] is True)
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "file:///etc/passwd"},
+            headers=key_header,
+        )
+        check("a file:// url is refused", r.status_code == 400, f"got {r.status_code}")
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://ex.com/a.jpg", "msg": "x" * 1100},
+            headers=key_header,
+        )
+        check("an over-long caption is refused", r.status_code == 422, f"got {r.status_code}")
+
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "not base64 and not a url!!"},
+            headers=key_header,
+        )
+        check("junk in media is refused", r.status_code == 400, f"got {r.status_code}")
+
+        # Anything the bridge holds the bytes for is archived on the way out.
+        original_dir = settings.media_dir
+        with _tempfile.TemporaryDirectory() as tmp_media:
+            settings.media_dir = tmp_media
+
+            payload = b"\xff\xd8\xffnot-really-a-jpeg-but-bytes"
+            r = await client.post(
+                "/send",
+                json={
+                    "id": "919876543210",
+                    "msg": "inline",
+                    "media": "data:image/jpeg;base64," + _b64.b64encode(payload).decode(),
+                },
+                headers=key_header,
+            )
+            check("data uri send accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+            body = r.json()
+            check("outbound media is archived", bool(body.get("mediaPath")), r.text[:120])
+            check(
+                "the archived file is on disk",
+                (Path(tmp_media) / body["mediaPath"]).is_file(),
+                str(body.get("mediaPath")),
+            )
+            check("mimetype came from the data uri", openwa.media_sent[-1]["mimetype"] == "image/jpeg")
+
+            r = await client.post(
+                "/send",
+                data={"id": "919876543210", "msg": "from disk"},
+                files={"file": ("holiday.png", b"\x89PNG\r\n\x1a\nfake", "image/png")},
+                headers=key_header,
+            )
+            check("multipart upload accepted", r.status_code == 200, f"got {r.status_code} {r.text[:160]}")
+            up = openwa.media_sent[-1]
+            check("upload kind from its content type", up["kind"] == "image", up["kind"])
+            check("upload filename preserved", up["filename"] == "holiday.png", str(up["filename"]))
+            check("upload sent as base64", bool(up["base64"]) and not up["url"])
+            check("upload is archived too", bool(r.json().get("mediaPath")), r.text[:120])
+
+            r = await client.post(
+                "/send",
+                data={"id": "919876543210"},
+                files={"file": ("notes.txt", b"plain text", "text/plain")},
+                headers=key_header,
+            )
+            check("an unknown type becomes a document", openwa.media_sent[-1]["kind"] == "document")
+
+            over = settings.send_max_encoded_bytes
+            settings.send_max_encoded_bytes = 64
+            r = await client.post(
+                "/send",
+                data={"id": "919876543210"},
+                files={"file": ("big.bin", b"A" * 4096, "application/octet-stream")},
+                headers=key_header,
+            )
+            check("an oversized upload is refused", r.status_code == 413, f"got {r.status_code}")
+            check("the refusal suggests a url", "URL" in r.text or "url" in r.text, r.text[:120])
+            settings.send_max_encoded_bytes = over
+
+        settings.media_dir = original_dir
+
+        r = await client.post("/send", data={"id": "919876543210"}, headers=key_header)
+        check("a form with no file and no text is refused", r.status_code == 422, f"got {r.status_code}")
+
+        openwa.fail_next = True
+        r = await client.post(
+            "/send",
+            json={"id": "919876543210", "media": "https://ex.com/x.jpg"},
+            headers=key_header,
+        )
+        check("a refused media send reports the failure", r.status_code >= 400, f"got {r.status_code}")
+        check(
+            "the failed media send is recorded",
+            any(d.get("status") == "failed" and d.get("type") == "image" for d in store.inserts),
+        )
+
+        print("\n-- forms and numbers --")
+
+        from app.numbers import to_chat_id as _to_chat_id  # noqa: PLC0415
+
+        openwa.sent.clear()
+        r = await client.post(
+            "/send",
+            data={"id": "919876543210", "msg": "sent as a form field"},
+            headers=key_header,
+        )
+        check("urlencoded form send accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check(
+            "the form's text arrives intact",
+            openwa.sent and openwa.sent[-1][1] == "sent as a form field",
+            str(openwa.sent[-1:]),
+        )
+
+        check(
+            "a 00 prefix is not given a second country code",
+            _to_chat_id("00628123456789", "91") == "628123456789@c.us",
+            _to_chat_id("00628123456789", "91"),
+        )
+        check(
+            "a bare national number still gets the default code",
+            _to_chat_id("9876543210", "91") == "919876543210@c.us",
+            _to_chat_id("9876543210", "91"),
+        )
+        check(
+            "a trunk zero is dropped before the country code",
+            _to_chat_id("09876543210", "91") == "919876543210@c.us",
+            _to_chat_id("09876543210", "91"),
+        )
+        check(
+            "a group jid is passed through untouched",
+            _to_chat_id("120363043211234567@g.us", "91") == "120363043211234567@g.us",
+        )
 
         print("\n-- reads --")
         r = await client.get("/messages", headers=key_header)

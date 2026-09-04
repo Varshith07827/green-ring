@@ -40,11 +40,16 @@ def to_chat_id(raw: str, default_country_code: str = "") -> str:
     if not digits:
         raise InvalidNumber(f"'{raw}' contains no digits")
 
-    # 00 is the international access prefix; strip it before the country code.
-    if digits.startswith("00"):
+    # 00 is the international access prefix. A number carrying it has already
+    # named its own country, so stripping it leaves a complete international
+    # number - and the default country code must not then be prepended. Without
+    # this, 00628123456789 with DEFAULT_COUNTRY_CODE=91 became 91628123456789:
+    # a different, quite possibly real, person.
+    dialled_international = digits.startswith("00")
+    if dialled_international:
         digits = digits[2:]
 
-    if default_country_code:
+    if default_country_code and not dialled_international:
         # Already international if it leads with the country code and is long
         # enough to carry a subscriber number behind it; otherwise treat the
         # input as national - drop any trunk-prefix zero and prepend the code.

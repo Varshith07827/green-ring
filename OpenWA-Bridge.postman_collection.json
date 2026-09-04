@@ -13,7 +13,7 @@
     {
       "key": "apiKey",
       "value": "",
-      "description": "BRIDGE_API_KEY from bridge/.env - sent as Authorization: Bearer"
+      "description": "BRIDGE_API_KEY from .env at the project root - sent as Authorization: Bearer"
     }
   ],
   "auth": {
@@ -49,7 +49,70 @@
           "mode": "raw",
           "raw": "{\n  \"id\": \"919876543210\",\n  \"msg\": \"Hello from Postman\"\n}"
         },
-        "description": "One endpoint for every chat - the recipient is `id` in the body, not a per-chat URL.\n\n`id` is the phone number including the country code (no + or spaces required), or a group id like 120363...@g.us.\n`msg` is the text, up to 4096 characters.\n\nAuth is the collection-level Bearer token. Returns the WhatsApp message id, which is also the key of the MongoDB document."
+        "description": "One endpoint for every chat - the recipient is `id` in the body, not a per-chat URL.\n\n`id` is the phone number including the country code (no + or spaces required), or a group id like 120363...@g.us.\n`msg` is the text, up to 4096 characters.\n\nTo send a file instead, see the two requests below.\n\nAuth is the collection-level Bearer token. Returns the WhatsApp message id, which is also the key of the MongoDB document."
+      }
+    },
+    {
+      "name": "Send a photo by URL",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/send",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "send"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": \"919876543210\",\n  \"msg\": \"on the roof\",\n  \"media\": \"https://example.com/photo.jpg\"\n}"
+        },
+        "description": "Send a file that is already hosted somewhere. The gateway fetches the URL itself, so nothing large travels through the bridge and there is no upload size limit to worry about.\n\n`media` also accepts a data: URI or raw base64.\n\nThe kind of WhatsApp message is chosen from the mimetype - image/* becomes a photo, video/* a video, audio/* an audio message, anything else a document. Set `type` to override it: image, video, audio, voice, document or sticker. `voice` sends audio as a voice note (the mic bubble with a waveform).\n\n`msg` becomes the caption here, and WhatsApp caps captions at 1024 characters.\n\nNote: URL sends are not copied to data/media - the bytes never pass through the bridge. mediaInfo.sourceUrl records where it came from."
+      }
+    },
+    {
+      "name": "Send a file (upload)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/send",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "send"
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "id",
+              "value": "919876543210",
+              "type": "text"
+            },
+            {
+              "key": "msg",
+              "value": "from my laptop",
+              "type": "text"
+            },
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        },
+        "description": "Send a file from this machine. Pick it in the `file` row - Postman sets the Content-Type header itself, so leave that alone.\n\nThe file's own type decides how it arrives; add a `type` field to override.\n\nUploads ARE archived: the bridge holds the bytes, so it writes a copy under data/media/ and returns the path as `mediaPath`.\n\nAbout 24 MiB is the ceiling, measured after base64 encoding. Larger than that, host the file and use the URL request instead."
       }
     },
     {
