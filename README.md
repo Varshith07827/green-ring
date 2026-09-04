@@ -30,7 +30,7 @@ anywhere via a queue — and archive every message, both directions, in MongoDB.
 
 ## Setting it up from scratch
 
-On a machine with **Node**, **Python** and **Google Chrome** installed:
+On a clean Windows machine:
 
 ```powershell
 git clone https://github.com/Varshith07827/green-ring.git
@@ -38,9 +38,16 @@ cd green-ring
 .\start.ps1
 ```
 
-That's the whole thing. The first run asks three questions — your MongoDB URI, the queue URL to poll
-(blank to skip), and its bearer token — then writes `.env`, installs dependencies, builds, and
-starts the two processes. It prints your `BRIDGE_API_KEY`; that's the token Postman sends.
+That's the whole thing. It checks for **Node 22+**, **Python 3.10+** and **Google Chrome**, and
+offers to install anything missing with winget — Windows asks permission for each. Then it asks three
+questions — your MongoDB URI, the queue URL to poll (blank to skip), and its bearer token — writes
+`.env`, installs dependencies, builds, and starts both processes. It prints your `BRIDGE_API_KEY`;
+that's the token Postman sends.
+
+If `MONGO_URI` points at this machine and nothing is listening there, it offers to install MongoDB
+too. A remote or Atlas URI is left alone — that's somebody else's server.
+
+When everything is already present it says nothing about any of this and goes straight to work.
 
 `.env` is deliberately **not** in the repo, since it holds secrets. The gateway's own `repo\.env` is
 **generated from it** on every run, which is what keeps the key those two processes share in step —

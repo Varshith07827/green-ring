@@ -13,6 +13,95 @@ $python = Join-Path $bridge ".venv\Scripts\python.exe"
 
 $env:Path = "C:\Program Files\nodejs;C:\Program Files\Git\usr\bin;" + $env:Path
 
+# ---- prerequisites -------------------------------------------------------
+# Node, Python and Chrome have to exist before anything else can run. Without
+# this check the first sign of trouble is a raw "npm is not recognized" three
+# steps later, which says nothing about what to do.
+
+function Update-PathFromRegistry {
+    # A fresh install writes PATH to the registry, but this already-running
+    # shell keeps the copy it started with - so node stays "not recognized"
+    # until the variable is re-read.
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $user = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "C:\Program Files\nodejs;C:\Program Files\Git\usr\bin;$machine;$user"
+}
+
+function Get-NodeVersion {
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    try { return [int](((& node -v) -replace '^v', '') -split '\.')[0] } catch { return $null }
+}
+
+function Get-PythonMinor {
+    # `python` on Windows is often the Store stub, which prints nothing useful
+    # and opens the Store instead. Judge it by what it actually reports.
+    try { $out = (& python --version 2>&1) | Out-String } catch { return $null }
+    if ($out -match 'Python 3\.(\d+)') { return [int]$Matches[1] }
+    return $null
+}
+
+function Find-Chrome {
+    @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+function Get-MissingPrereqs {
+    $missing = @()
+    $node = Get-NodeVersion
+    if ($null -eq $node) { $missing += @{ Name = "Node.js"; Id = "OpenJS.NodeJS.LTS"; Why = "not installed" } }
+    elseif ($node -lt 22) { $missing += @{ Name = "Node.js"; Id = "OpenJS.NodeJS.LTS"; Why = "v$node is too old, needs 22+" } }
+
+    $py = Get-PythonMinor
+    if ($null -eq $py) { $missing += @{ Name = "Python"; Id = "Python.Python.3.12"; Why = "not installed" } }
+    elseif ($py -lt 10) { $missing += @{ Name = "Python"; Id = "Python.Python.3.12"; Why = "3.$py is too old, needs 3.10+" } }
+
+    if (-not (Find-Chrome)) { $missing += @{ Name = "Google Chrome"; Id = "Google.Chrome"; Why = "not installed" } }
+    return $missing
+}
+
+$missing = Get-MissingPrereqs
+if ($missing.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Missing prerequisites:" -ForegroundColor Yellow
+    foreach ($m in $missing) { Write-Host "    - $($m.Name)  ($($m.Why))" }
+    Write-Host ""
+
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "  winget is not available, so these cannot be installed automatically." -ForegroundColor DarkGray
+        Write-Host "    Node.js         https://nodejs.org/          (22 LTS or newer)" -ForegroundColor DarkGray
+        Write-Host "    Python          https://www.python.org/      (3.10 or newer)" -ForegroundColor DarkGray
+        Write-Host "    Google Chrome   https://www.google.com/chrome/" -ForegroundColor DarkGray
+        Write-Error "Install the above, then run this again."
+    }
+
+    $answer = Read-Host "  Install them now with winget? [Y/n]"
+    if ($answer -and $answer -notmatch '^(y|yes)$') {
+        Write-Error "Cannot continue without them."
+    }
+
+    Write-Host "  Windows will ask for permission for each one." -ForegroundColor DarkGray
+    foreach ($m in $missing) {
+        Write-Host "  installing $($m.Name)..." -ForegroundColor Cyan
+        winget install --id $m.Id --silent --accept-package-agreements --accept-source-agreements
+        # winget reports "no applicable upgrade" as a failure; the re-check
+        # below is what actually decides, so a non-zero code is not fatal here.
+    }
+
+    Update-PathFromRegistry
+    $missing = Get-MissingPrereqs
+    if ($missing.Count -gt 0) {
+        Write-Host ""
+        foreach ($m in $missing) { Write-Warning "$($m.Name) is still $($m.Why)" }
+        Write-Error "Close this window, open a new one, and run .\start.ps1 again - a fresh install often needs a new terminal before it is visible."
+    }
+    Write-Host "  all prerequisites present." -ForegroundColor Green
+    Write-Host ""
+}
+
 # ---- configuration -------------------------------------------------------
 # One file, at the project root, gitignored because it holds secrets. The
 # gateway's own repo\.env is GENERATED from it below on every run - so the key
@@ -120,6 +209,38 @@ EVENTS_SECRET=$(New-Secret 24)
 $conf = Read-EnvFile $rootEnv
 $gatewayKey = $conf["OPENWA_API_KEY"]
 if (-not $gatewayKey) { Write-Error "OPENWA_API_KEY is missing from .env" }
+
+# ---- MongoDB -------------------------------------------------------------
+# Only worth offering when the URI points at this machine. A remote or Atlas
+# URI is somebody else's server, and installing one locally would be both
+# useless and surprising.
+$mongoUri = $conf["MONGO_URI"]
+if ($mongoUri -match '^mongodb(\+srv)?://(localhost|127\.0\.0\.1)') {
+    $port = 27017
+    if ($mongoUri -match ':(\d{2,5})') { $port = [int]$Matches[1] }
+    if (-not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+        Write-Host ""
+        Write-Warning "MONGO_URI points at this machine, but nothing is listening on port $port."
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            $answer = Read-Host "  Install MongoDB Community Server now? [Y/n]"
+            if (-not $answer -or $answer -match '^(y|yes)$') {
+                Write-Host "  installing MongoDB (this one is a few hundred MB)..." -ForegroundColor Cyan
+                winget install --id MongoDB.Server --silent --accept-package-agreements --accept-source-agreements
+                Update-PathFromRegistry
+                # The installer registers a service that takes a moment to listen.
+                foreach ($i in 1..15) {
+                    if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { break }
+                    Start-Sleep -Seconds 2
+                }
+            }
+        }
+        if (-not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+            Write-Warning "Still nothing on port $port. The bridge will not start until MONGO_URI reaches a running MongoDB."
+            Write-Host "  Either install it, start the service, or point MONGO_URI in .env at another server." -ForegroundColor DarkGray
+        }
+        Write-Host ""
+    }
+}
 
 # The gateway only ever SEEDS from API_MASTER_KEY, on its very first boot, and
 # authenticates against its database afterwards. Once repo\data\.api-key exists,
