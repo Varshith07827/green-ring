@@ -294,8 +294,11 @@ Write-Host "     Start the 'default' session and scan the QR. Once only - it is"
 Write-Host "     remembered across restarts."
 Write-Host ""
 Write-Host "  2. Then send messages:  " -NoNewline; Write-Host "POST http://localhost:8000/send" -ForegroundColor Yellow
-Write-Host "     header  X-API-Key: <BRIDGE_API_KEY from bridge\.env>"
 Write-Host "     body    {`"id`": `"919876543210`", `"msg`": `"hello`"}"
+# Reprinted here because on a first run it scrolled past several minutes of
+# npm output, and it is the one value needed to send anything.
+Write-Host "     header  " -NoNewline
+Write-Host "Authorization: Bearer $($conf['BRIDGE_API_KEY'])" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  Check readiness any time:  curl.exe http://localhost:8000/health" -ForegroundColor DarkGray
 Write-Host "  Both processes run in their own windows. Close them to stop." -ForegroundColor DarkGray
