@@ -1,21 +1,25 @@
 # OpenWA Bridge
 
-Send WhatsApp messages by POSTing `{"id": "<phone>", "msg": "<text>"}` — from this machine, or from
-anywhere via a queue — and archive every message, both directions, in MongoDB.
+Send a WhatsApp message by POSTing `{"id": "<phone>", "msg": "<text>"}` — from this machine, or from
+anywhere via a queue — and archive every message, both directions, in MongoDB, with photos and voice
+notes written to disk.
+
+Runs natively on Linux or Windows. **No Docker.**
 
 ```
-                         Remote desktop
-   ┌────────────────────────────────────────────────────┐
-   │  bridge (Python, :8000)                            │
-   │    POST /send  {id, msg}  ──────────┐              │
-   │    GET  POLL_URL every 3s ──────────┤              │
+   ┌─────────────────── your server ────────────────────┐
+   │                                                    │
+   │   bridge (Python, :8000)                           │
+   │     POST /send   {id, msg}   ───────┐              │
+   │     GET  POLL_URL  every 3s  ───────┤              │
    │                                     ▼              │
-   │  OpenWA gateway (Node, :2785) ── headless Chrome ──┼──► WhatsApp
-   │                    │                               │
-   │       events       ▼                               │
-   └──────────────────────┬─────────────────────────────┘
-                          ▼  every message, both directions
-                       MongoDB
+   │   OpenWA gateway (Node, :2785) ─ headless Chrome ──┼──► WhatsApp
+   │            │                                       │
+   │            ▼  every message, in and out            │
+   │     ┌──────────────┬──────────────┐                │
+   │  MongoDB        data/media/    (text, who,         │
+   │  (messages)     (the files)     when, status)      │
+   └────────────────────────────────────────────────────┘
 ```
 
 | Path                                    | What it is                                                          |
@@ -23,15 +27,14 @@ anywhere via a queue — and archive every message, both directions, in MongoDB.
 | `repo/`                                 | [OpenWA](https://github.com/rmyndharis/OpenWA), unmodified upstream |
 | `bridge/`                               | The Python service — the part you talk to                           |
 | `.env`                                  | The only file you configure — six settings                          |
-| `start.sh` / `start.ps1`                | Starts everything — Linux / Windows                                 |
+| `start.sh` / `start.ps1`                | Sets up and starts everything — Linux / Windows                     |
 | `install-service.sh`                    | Registers both as systemd services (Linux)                          |
+| `data/media/`                           | Photos, voice notes and documents, by date. Not in git.             |
 | `OpenWA-Bridge.postman_collection.json` | Import into Postman                                                 |
 
 ---
 
 ## Setting it up from scratch
-
-Runs on **Linux** or **Windows**, natively — no Docker either way.
 
 ### Linux (Debian/Ubuntu)
 
@@ -62,12 +65,13 @@ cd green-ring
 .\start.ps1
 ```
 
-### Both do the same thing
+### Both scripts do the same thing
 
-Check for **Node 22+**, **Python 3.10+** and a browser, and install what is missing — apt and
-NodeSource on Linux, winget on Windows. Then ask three questions — your MongoDB URI, the queue URL to poll (blank to skip), and its bearer token — writes
-`.env`, installs dependencies, builds, and starts both processes. It prints your `BRIDGE_API_KEY`;
-that's the token Postman sends.
+They check for **Node 22+**, **Python 3.10+** and a browser, and install whatever is missing — apt
+and NodeSource on Linux, winget on Windows. Then they ask three questions: your MongoDB URI, the
+queue URL to poll (blank to skip), and its bearer token. From those they write `.env`, install
+dependencies, build, and start both processes — printing your `BRIDGE_API_KEY`, the token you send
+from Postman.
 
 If `MONGO_URI` points at this machine and nothing is listening there, Windows offers to install
 MongoDB; Linux tells you where to get it. A remote or Atlas URI is left alone either way — that's
@@ -79,25 +83,25 @@ installed alongside.
 
 When everything is already present it says nothing about any of this and goes straight to work.
 
-`.env` is deliberately **not** in the repo, since it holds secrets. The gateway's own `repo\.env` is
+`.env` is deliberately **not** in the repo, since it holds secrets. The gateway's own `repo/.env` is
 **generated from it** on every run, which is what keeps the key those two processes share in step —
 setting it by hand is where a fresh install usually goes wrong.
 
 **Then, once:** open <http://localhost:2785>, start the `default` session and scan the QR from
 WhatsApp → Settings → Linked devices → Link a device. The session already exists — the bridge creates
 it at startup — so you only press start and scan. The pairing survives restarts
-(`AUTO_START_SESSIONS=true`, session data in `repo\data\sessions`), so this is a one-time step.
+(`AUTO_START_SESSIONS=true`, session data in `repo/data/sessions`), so this is a one-time step.
 
 Check it took:
 
-```powershell
-curl.exe http://localhost:8000/health
+```bash
+curl http://localhost:8000/health
 ```
 
 `{"ok":true,...,"session":{"status":"ready","phone":"91..."}}` means you are live.
 
-Every run after the first is just `.\start.ps1` — it skips setup, install and build when they are
-already done.
+Every run after the first is just the same start script — it skips setup, install and build when
+they are already done.
 
 ### The queue is not part of this
 
@@ -258,6 +262,13 @@ both read the same pending row and send the message twice. The claim is
 Queue a message from any PC:
 
 ```bash
+curl -X POST https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam   -H "Authorization: Bearer <API_TOKEN>"   -H "Content-Type: application/json"   -d '{"id":"919876543210","msg":"Hello"}'
+```
+
+On Windows PowerShell that same call needs `curl.exe --%` and backslash-escaped quotes — PowerShell
+mangles both otherwise:
+
+```powershell
 curl.exe --% -X POST https://whatsapp-webhook-api.alonewalker07827.workers.dev/wam -H "Authorization: Bearer <API_TOKEN>" -H "Content-Type: application/json" -d "{\"id\":\"919876543210\",\"msg\":\"Hello\"}"
 ```
 
@@ -338,7 +349,7 @@ lists the full set, commented.
 | `POLL_URL`       | Your queue endpoint. Set to the deployed Worker — polling is on.                       |
 | `POLL_TOKEN`     | Bearer token sent with each poll. Matches the Worker's `API_TOKEN` secret.             |
 | `BRIDGE_API_KEY` | The bearer token Postman sends as `Authorization: Bearer <key>`.                       |
-| `OPENWA_API_KEY` | Shared with the gateway. Adopted from `repo\data\.api-key` when the gateway has already seeded one. |
+| `OPENWA_API_KEY` | Shared with the gateway. Adopted from `repo/data/.api-key` when the gateway has already seeded one. |
 | `EVENTS_SECRET`  | Signs the gateway's internal event deliveries.                                         |
 
 Useful optional ones: `POLL_INTERVAL` (3s — raise it if your endpoint is on shared hosting),
@@ -349,55 +360,80 @@ Both `.env` files hold secrets — keep them off GitHub (`bridge\.gitignore` cov
 
 ---
 
-## Notes on this install
+## Why the install looks unusual
 
-**Dependencies were installed with `npm ci --ignore-scripts`, then `node scripts/postinstall.js`.**
-Necessary, not a shortcut: `better-sqlite3` has no install script, so npm auto-runs `node-gyp
-rebuild`, which demands Visual Studio C++ Build Tools (several GB). The package already ships a
-prebuilt `prebuilds/win32-x64.node` that its loader prefers over anything node-gyp would produce, so
-skipping the build costs nothing. `postinstall.js` then applies the ten upstream
-`whatsapp-web.js`/`baileys` patches a plain `--ignore-scripts` install would have skipped. `start.ps1`
-does both in the right order, and adds Git's `patch.exe` to PATH for the patch step.
+**Dependencies go in with `npm ci --ignore-scripts`, then `node scripts/postinstall.js` by hand.**
+Necessary, not a shortcut. `better-sqlite3` has no install script, so npm falls back to running
+`node-gyp rebuild` — which wants a full C++ toolchain (Visual Studio Build Tools on Windows,
+several GB). The package already ships prebuilt binaries for every platform this runs on, and its
+loader prefers them over anything node-gyp would produce, so skipping the build costs nothing.
+Running `postinstall.js` afterwards restores the ten upstream `whatsapp-web.js`/`baileys` patches a
+plain `--ignore-scripts` install would have skipped — those do matter. Both start scripts do this in
+the right order.
 
-**Puppeteer never downloaded its own Chromium** (same reason), so `repo\.env` points
-`PUPPETEER_EXECUTABLE_PATH` at the installed Google Chrome. Update that line if Chrome moves.
+**Puppeteer therefore never downloads its own browser**, so `PUPPETEER_EXECUTABLE_PATH` in
+`repo/.env` is set explicitly — to the installed Chrome on Windows, and on Linux to Puppeteer's
+Chrome for Testing (x64) or the distro chromium (arm64). Regenerated on every run, so a machine
+change is picked up automatically.
 
-**`SSRF_ALLOWED_HOSTS=localhost,127.0.0.1` in `repo\.env` is load-bearing.** The gateway refuses to
-register an event subscription pointing at a loopback address unless it is allowlisted, and the
-bridge listens on loopback. Remove it and events stop arriving.
+**`SSRF_ALLOWED_HOSTS=localhost,127.0.0.1` is load-bearing.** The gateway refuses to register an
+event subscription pointing at a loopback address unless it is allowlisted, and the bridge listens on
+loopback. Remove it and incoming messages silently stop being recorded.
 
-**Harmless Windows warnings at startup:** `chmod 0o600 failed ... ENOENT` and `Docker not available`.
-Neither affects anything here.
+**Harmless startup noise:** `Docker not available` on both platforms (container orchestration you are
+not using), and `chmod 0o600 failed … ENOENT` on Windows, where the gateway hardens a file the way
+Linux would. Neither affects anything.
 
 ## Keeping it running unattended
 
-Run both as services with [NSSM](https://nssm.cc/) so they survive logout and restart on failure:
+Both start scripts run the processes in your terminal, and they **die when it closes**. That is fine
+for a first look and wrong for a server.
+
+**Linux** — systemd, which is the whole reason `install-service.sh` exists:
+
+```bash
+./install-service.sh
+```
+
+Starts on boot, restarts on failure, survives logout, and caps the gateway's memory so one runaway
+Chrome cannot take the machine down with it. Logs go to the journal:
+
+```bash
+journalctl -u openwa-gateway -f
+journalctl -u openwa-bridge -f
+```
+
+**Windows** — [NSSM](https://nssm.cc/), pointing at this checkout:
 
 ```powershell
 nssm install OpenWA "C:\Program Files\nodejs\node.exe" "dist\main"
-nssm set OpenWA AppDirectory "C:\Users\nlabs\Desktop\openwa\repo"
+nssm set OpenWA AppDirectory "<path>\repo"
 
-nssm install OpenWABridge "C:\Users\nlabs\Desktop\openwa\bridge\.venv\Scripts\python.exe" "-m app.main"
-nssm set OpenWABridge AppDirectory "C:\Users\nlabs\Desktop\openwa\bridge"
+nssm install OpenWABridge "<path>\bridge\.venv\Scripts\python.exe" "-m app.main"
+nssm set OpenWABridge AppDirectory "<path>\bridge"
 ```
 
-Order does not matter: the bridge retries via `POST /events/register`, and the gateway retries
-deliveries.
+Start order does not matter either way: the bridge retries registration via `POST /events/register`,
+and the gateway retries deliveries.
 
 ## Before you connect a real number
 
 This drives WhatsApp Web through a reverse-engineered client, not Meta's official API. WhatsApp can
 restrict or ban a number for automated use. **Use a dedicated number you can afford to lose**, warm
-it up for a few days before sending in volume, and keep the pace human. `repo\README.md` has
+it up for a few days before sending in volume, and keep the pace human. `repo/README.md` has
 upstream's full guidance.
 
 ## Testing without touching WhatsApp
 
-```powershell
-cd bridge
-.\.venv\Scripts\python.exe scripts\selftest.py
+```bash
+bridge/.venv/bin/python bridge/scripts/selftest.py        # Linux
 ```
 
-89 checks over auth (both header styles), number parsing, the send path, every event branch, and the
-poll loop's parsing, dedup rules, refusals and failure handling, plus contact resolution and media
-filenames — with MongoDB and the gateway stubbed out.
+```powershell
+bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py
+```
+
+**106 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
+running: auth on both header styles, number parsing, the send path, every event branch, media
+detection and filenames, contact resolution, and the poll loop's parsing, dedup rules, refusals and
+failure handling.
