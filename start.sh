@@ -91,18 +91,63 @@ PY_MINOR="$(py_minor)"
 # tests against, minus anything only a container needs.
 if command -v apt-get >/dev/null 2>&1 && [[ ! -f "$ROOT/.deps-installed" ]]; then
   step "Installing the Chrome runtime libraries"
-  # libasound2 was renamed libasound2t64 in the 64-bit time_t transition, so
-  # try the new name and fall back rather than failing the whole install.
-  ALSA="libasound2t64"
-  apt-cache show "$ALSA" >/dev/null 2>&1 || ALSA="libasound2"
-  $SUDO apt-get update -qq
-  $SUDO apt-get install -y -qq --no-install-recommends \
-    fonts-liberation "$ALSA" libatk-bridge2.0-0 libatk1.0-0 libcups2 \
-    libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 libx11-xcb1 \
-    libxcomposite1 libxdamage1 libxrandr2 xdg-utils \
-    patch curl ca-certificates sqlite3 ffmpeg
-  touch "$ROOT/.deps-installed"
-  ok "system libraries installed"
+
+  # Refresh the index BEFORE probing: on a fresh server the cache is empty and
+  # every name below would otherwise look missing.
+  $SUDO apt-get update -qq || warn "apt-get update reported a problem; continuing with the cache as it is"
+
+  # Ubuntu 24.04's 64-bit time_t transition renamed a number of these with a
+  # `t64` suffix (libasound2, libatk1.0-0, libatk-bridge2.0-0, libcups2,
+  # libgtk-3-0 ...). Probe for the suffixed name first and fall back, rather
+  # than hardcoding either spelling - which release renamed what is a moving
+  # target, and guessing wrong kills the whole install.
+  have_pkg() {
+    local candidate
+    candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+    [[ -n "$candidate" && "$candidate" != "(none)" ]]
+  }
+
+  PKGS=()
+  UNKNOWN=()
+  for base in fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+              libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 \
+              libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 \
+              xdg-utils patch curl ca-certificates sqlite3 ffmpeg; do
+    if have_pkg "${base}t64"; then
+      PKGS+=("${base}t64")
+    elif have_pkg "$base"; then
+      PKGS+=("$base")
+    else
+      UNKNOWN+=("$base")
+    fi
+  done
+
+  # One batch install, quiet unless it fails. If it does, retry individually so
+  # a single unavailable package cannot take the other twenty down with it.
+  FAILED=()
+  APT_LOG="$(mktemp)"
+  if [[ ${#PKGS[@]} -gt 0 ]]; then
+    if ! $SUDO apt-get install -y -q --no-install-recommends "${PKGS[@]}" >"$APT_LOG" 2>&1; then
+      warn "the batch install failed; retrying one package at a time"
+      for pkg in "${PKGS[@]}"; do
+        $SUDO apt-get install -y -q --no-install-recommends "$pkg" >>"$APT_LOG" 2>&1 || FAILED+=("$pkg")
+      done
+    fi
+  fi
+
+  if [[ ${#UNKNOWN[@]} -gt 0 || ${#FAILED[@]} -gt 0 ]]; then
+    warn "some system packages could not be installed:"
+    [[ ${#UNKNOWN[@]} -gt 0 ]] && say "  not in any configured repository: ${UNKNOWN[*]}"
+    [[ ${#FAILED[@]} -gt 0 ]]  && say "  failed to install: ${FAILED[*]}"
+    say "  full apt output: $APT_LOG"
+    say ""
+    say "Setup continues. If Chrome later refuses to start, this is the place to"
+    say "look - check which library it names and install that package by hand."
+  else
+    rm -f "$APT_LOG"
+    touch "$ROOT/.deps-installed"
+    ok "system libraries installed"
+  fi
 fi
 
 # --------------------------------------------------------------------------
