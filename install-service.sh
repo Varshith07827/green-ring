@@ -44,6 +44,28 @@ fi
 
 NODE_BIN="$(command -v node)" || die "node is not on PATH"
 
+# Both services write under these. A directory left owned by root - by a first
+# run under sudo, or a clone made as root - fails only once systemd starts the
+# unit as $RUN_USER, and Restart=always then turns that into a boot loop whose
+# error ("the media storage root is not writable") reads like bad config rather
+# than bad ownership. Check it here, while there is someone watching.
+as_run_user() {
+  if [[ "$RUN_USER" == "$(id -un)" ]]; then "$@"; else sudo -u "$RUN_USER" "$@"; fi
+}
+for dir in "$REPO/data" "$REPO/data/media" "$REPO/data/sessions" "$BRIDGE"; do
+  as_run_user mkdir -p "$dir" 2>/dev/null || true
+  if ! as_run_user test -w "$dir"; then
+    say "$RUN_USER cannot write to:"
+    say "  $dir"
+    say ""
+    say "Fix the ownership and run this again:"
+    printf '    [33msudo chown -R %s %s[0m
+' "$RUN_USER" "$ROOT"
+    say ""
+    die "Refusing to install a service that cannot start."
+  fi
+done
+
 say "installing as user: $RUN_USER"
 
 # The gateway. Restart=always because a crashed engine takes WhatsApp with it,
