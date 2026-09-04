@@ -23,14 +23,38 @@ anywhere via a queue — and archive every message, both directions, in MongoDB.
 | `repo/`                                 | [OpenWA](https://github.com/rmyndharis/OpenWA), unmodified upstream |
 | `bridge/`                               | The Python service — the part you talk to                           |
 | `.env`                                  | The only file you configure — six settings                          |
-| `start.ps1`                             | Starts everything                                                   |
+| `start.sh` / `start.ps1`                | Starts everything — Linux / Windows                                 |
+| `install-service.sh`                    | Registers both as systemd services (Linux)                          |
 | `OpenWA-Bridge.postman_collection.json` | Import into Postman                                                 |
 
 ---
 
 ## Setting it up from scratch
 
-On a clean Windows machine:
+Runs on **Linux** or **Windows**, natively — no Docker either way.
+
+### Linux (Debian/Ubuntu)
+
+```bash
+git clone https://github.com/Varshith07827/green-ring.git
+cd green-ring
+./start.sh
+```
+
+Then, for a server you are not sitting in front of:
+
+```bash
+./install-service.sh
+```
+
+That registers both as systemd services, so they start on boot, restart on
+failure, and survive you logging out. `./start.sh` alone runs them in your
+terminal and stops when it closes — fine for a first look, wrong for a server.
+
+Logs are `journalctl -u openwa-gateway -f` and `journalctl -u openwa-bridge -f`.
+Remove with `./install-service.sh --remove`.
+
+### Windows
 
 ```powershell
 git clone https://github.com/Varshith07827/green-ring.git
@@ -38,14 +62,20 @@ cd green-ring
 .\start.ps1
 ```
 
-That's the whole thing. It checks for **Node 22+**, **Python 3.10+** and **Google Chrome**, and
-offers to install anything missing with winget — Windows asks permission for each. Then it asks three
-questions — your MongoDB URI, the queue URL to poll (blank to skip), and its bearer token — writes
+### Both do the same thing
+
+Check for **Node 22+**, **Python 3.10+** and a browser, and install what is missing — apt and
+NodeSource on Linux, winget on Windows. Then ask three questions — your MongoDB URI, the queue URL to poll (blank to skip), and its bearer token — writes
 `.env`, installs dependencies, builds, and starts both processes. It prints your `BRIDGE_API_KEY`;
 that's the token Postman sends.
 
-If `MONGO_URI` points at this machine and nothing is listening there, it offers to install MongoDB
-too. A remote or Atlas URI is left alone — that's somebody else's server.
+If `MONGO_URI` points at this machine and nothing is listening there, Windows offers to install
+MongoDB; Linux tells you where to get it. A remote or Atlas URI is left alone either way — that's
+somebody else's server.
+
+On Linux, Chrome comes from Puppeteer's own Chrome for Testing download on x64, and the distro's
+`chromium` on arm64, which has no Chrome for Testing build. The shared libraries it needs are
+installed alongside.
 
 When everything is already present it says nothing about any of this and goes straight to work.
 

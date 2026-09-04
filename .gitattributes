@@ -1,0 +1,11 @@
+# Shell scripts must keep LF endings whatever platform they are edited on.
+# A .sh checked out with CRLF fails on Linux with "bad interpreter: /bin/bash^M",
+# and this repo is authored on Windows where autocrlf would do exactly that.
+*.sh text eol=lf
+
+# systemd units and env files are read by Linux tooling too.
+*.service text eol=lf
+.env.example text eol=lf
+
+# PowerShell is the Windows half; CRLF is right for it.
+*.ps1 text eol=crlf
