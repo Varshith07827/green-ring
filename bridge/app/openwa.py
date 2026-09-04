@@ -176,6 +176,85 @@ class OpenWAClient:
 
         return await self._post_message(f"send-{kind}", payload)
 
+    # -- the rest of the send family ----------------------------------------
+    # Thin on purpose: each one is the gateway's own contract with the chat id
+    # already resolved. Anything that needs deciding is decided in main.py, so
+    # these stay readable next to the API docs they mirror.
+
+    async def reply(self, chat_id: str, quoted_message_id: str, text: str) -> dict:
+        return await self._post_message(
+            "reply", {"chatId": chat_id, "quotedMessageId": quoted_message_id, "text": text}
+        )
+
+    async def react(self, chat_id: str, message_id: str, emoji: str) -> dict:
+        # An empty emoji is not a missing value here - it is how a reaction is removed.
+        return await self._post_message(
+            "react", {"chatId": chat_id, "messageId": message_id, "emoji": emoji}
+        )
+
+    async def forward(self, from_chat_id: str, to_chat_id: str, message_id: str) -> dict:
+        return await self._post_message(
+            "forward",
+            {"fromChatId": from_chat_id, "toChatId": to_chat_id, "messageId": message_id},
+        )
+
+    async def send_location(
+        self,
+        chat_id: str,
+        latitude: float,
+        longitude: float,
+        description: str | None = None,
+        address: str | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "chatId": chat_id,
+            "latitude": latitude,
+            "longitude": longitude,
+        }
+        if description:
+            payload["description"] = description
+        if address:
+            payload["address"] = address
+        return await self._post_message("send-location", payload)
+
+    async def send_contact(self, chat_id: str, name: str, number: str) -> dict:
+        return await self._post_message(
+            "send-contact",
+            {"chatId": chat_id, "contactName": name, "contactNumber": number},
+        )
+
+    async def send_poll(self, chat_id: str, name: str, options: list[str]) -> dict:
+        return await self._post_message(
+            "send-poll", {"chatId": chat_id, "name": name, "options": options}
+        )
+
+    async def edit_message(self, chat_id: str, message_id: str, body: str) -> dict:
+        return await self._post_message(
+            "edit", {"chatId": chat_id, "messageId": message_id, "body": body}
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str, for_everyone: bool) -> dict:
+        return await self._post_message(
+            "delete",
+            {"chatId": chat_id, "messageId": message_id, "forEveryone": for_everyone},
+        )
+
+    async def star_message(self, chat_id: str, message_id: str, star: bool) -> dict:
+        return await self._post_message(
+            "star", {"chatId": chat_id, "messageId": message_id, "star": star}
+        )
+
+    async def pin_message(
+        self, chat_id: str, message_id: str, duration_seconds: int | None = None
+    ) -> dict:
+        payload: dict[str, Any] = {"chatId": chat_id, "messageId": message_id}
+        if duration_seconds:
+            payload["durationSeconds"] = duration_seconds
+        return await self._post_message("pin", payload)
+
+    async def unpin_message(self, chat_id: str, message_id: str) -> dict:
+        return await self._post_message("unpin", {"chatId": chat_id, "messageId": message_id})
+
     async def contact_phone(self, contact_id: str) -> str | None:
         """Resolve a privacy id (`@lid`) to a phone number, best-effort.
 

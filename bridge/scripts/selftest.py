@@ -123,6 +123,7 @@ class FakeOpenWA:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
         self.media_sent: list[dict[str, Any]] = []
+        self.actions: list[dict[str, Any]] = []
         self.fail_next = False
         self.fail_status = 400
         self.counter = 0
@@ -176,6 +177,60 @@ class FakeOpenWA:
             }
         )
         return {"messageId": f"true_{chat_id}_MED{self.counter}"}
+
+    async def _action(self, _action_name, **kwargs):
+        if self.fail_next:
+            self.fail_next = False
+            raise OpenWAError("Internal server error", status=self.fail_status)
+        self.counter += 1
+        self.actions.append({"action": _action_name, **kwargs})
+        return {"messageId": f"ACT{self.counter}"}
+
+    async def reply(self, chat_id, quoted_message_id, text):
+        return await self._action("reply", chatId=chat_id, quoted=quoted_message_id, text=text)
+
+    async def react(self, chat_id, message_id, emoji):
+        return await self._action("react", chatId=chat_id, messageId=message_id, emoji=emoji)
+
+    async def forward(self, from_chat_id, to_chat_id, message_id):
+        return await self._action(
+            "forward", fromChatId=from_chat_id, toChatId=to_chat_id, messageId=message_id
+        )
+
+    async def send_location(self, chat_id, latitude, longitude, description=None, address=None):
+        return await self._action(
+            "location",
+            chatId=chat_id,
+            latitude=latitude,
+            longitude=longitude,
+            description=description,
+            address=address,
+        )
+
+    async def send_contact(self, chat_id, name, number):
+        return await self._action("contact", chatId=chat_id, name=name, number=number)
+
+    async def send_poll(self, chat_id, name, options):
+        return await self._action("poll", chatId=chat_id, name=name, options=options)
+
+    async def edit_message(self, chat_id, message_id, body):
+        return await self._action("edit", chatId=chat_id, messageId=message_id, body=body)
+
+    async def delete_message(self, chat_id, message_id, for_everyone):
+        return await self._action(
+            "delete", chatId=chat_id, messageId=message_id, forEveryone=for_everyone
+        )
+
+    async def star_message(self, chat_id, message_id, star):
+        return await self._action("star", chatId=chat_id, messageId=message_id, star=star)
+
+    async def pin_message(self, chat_id, message_id, duration_seconds=None):
+        return await self._action(
+            "pin", chatId=chat_id, messageId=message_id, durationSeconds=duration_seconds
+        )
+
+    async def unpin_message(self, chat_id, message_id):
+        return await self._action("unpin", chatId=chat_id, messageId=message_id)
 
     async def ensure_webhook(self, url, events, secret):
         return {"action": "created", "webhook": {"id": "wh-1", "url": url, "events": events}}
@@ -795,6 +850,148 @@ async def run() -> int:
             "a group jid is passed through untouched",
             _to_chat_id("120363043211234567@g.us", "91") == "120363043211234567@g.us",
         )
+
+        print("\n-- the rest of the send family --")
+
+        openwa.actions.clear()
+
+        # Something to act on, so the change routes have a row to merge into.
+        r = await client.post(
+            "/send", json={"id": "919876543210", "msg": "the original"}, headers=key_header
+        )
+        target = r.json()["messageId"]
+
+        r = await client.post(
+            "/reply",
+            json={"to": "919876543210", "replyTo": target, "text": "a reply"},
+            headers=key_header,
+        )
+        check("reply accepted, with aliases", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check("reply quotes the message", openwa.actions[-1]["quoted"] == target)
+        replied = store.docs[("default", r.json()["messageId"])]
+        check("the reply is its own row", replied["body"] == "a reply", str(replied.get("body")))
+        check("and records what it quoted", replied.get("quotedMessageId") == target)
+
+        r = await client.post(
+            "/react",
+            json={"id": "919876543210", "messageId": target, "emoji": "\U0001f44d"},
+            headers=key_header,
+        )
+        check("react accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check(
+            "the reaction lands on the original row",
+            store.docs[("default", target)].get("myReaction") == "\U0001f44d",
+        )
+        check(
+            "a reaction does not invent a message",
+            not any(d.get("type") == "reaction" for d in store.docs.values()),
+        )
+
+        r = await client.post(
+            "/react",
+            json={"id": "919876543210", "messageId": target, "emoji": ""},
+            headers=key_header,
+        )
+        check("an empty emoji is allowed (it removes the reaction)", r.status_code == 200, f"got {r.status_code}")
+
+        r = await client.post(
+            "/forward",
+            json={"id": "919876543210", "from": "919999999999", "messageId": target},
+            headers=key_header,
+        )
+        check("forward accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check("both chats are resolved", openwa.actions[-1]["fromChatId"] == "919999999999@c.us")
+
+        r = await client.post(
+            "/location",
+            json={"id": "919876543210", "lat": 17.385, "lng": 78.4867, "description": "Hyderabad"},
+            headers=key_header,
+        )
+        check("location accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check("coordinates passed through", openwa.actions[-1]["latitude"] == 17.385)
+        loc = store.docs[("default", r.json()["messageId"])]
+        check("location stored on the row", loc["location"]["longitude"] == 78.4867)
+
+        r = await client.post(
+            "/location", json={"id": "919876543210", "lat": 200, "lng": 0}, headers=key_header
+        )
+        check("an impossible latitude is refused", r.status_code == 422, f"got {r.status_code}")
+
+        r = await client.post(
+            "/contact",
+            json={"id": "919876543210", "contactName": "Bob", "contactNumber": "919111111111"},
+            headers=key_header,
+        )
+        check("contact accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check("the card is the payload, not the recipient", openwa.actions[-1]["name"] == "Bob")
+
+        r = await client.post(
+            "/poll",
+            json={"id": "919876543210", "name": "Where?", "options": ["Park", "Beach", "Home"]},
+            headers=key_header,
+        )
+        check("poll accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        check("options passed through", len(openwa.actions[-1]["options"]) == 3)
+
+        r = await client.post(
+            "/poll", json={"id": "919876543210", "name": "One?", "options": ["Only"]}, headers=key_header
+        )
+        check("a one-option poll is refused", r.status_code == 422, f"got {r.status_code}")
+
+        r = await client.post(
+            "/edit",
+            json={"id": "919876543210", "messageId": target, "msg": "the corrected text"},
+            headers=key_header,
+        )
+        check("edit accepted", r.status_code == 200, f"got {r.status_code} {r.text[:120]}")
+        edited = store.docs[("default", target)]
+        check("the body is replaced", edited["body"] == "the corrected text", str(edited.get("body")))
+        check("the old text is kept", edited["editHistory"][0]["body"] == "the original", str(edited.get("editHistory")))
+        check("and it is marked edited", edited.get("edited") is True)
+
+        r = await client.post(
+            "/star", json={"id": "919876543210", "messageId": target, "star": True}, headers=key_header
+        )
+        check("star accepted", r.status_code == 200, f"got {r.status_code}")
+        check("starred on the row", store.docs[("default", target)].get("starred") is True)
+
+        r = await client.post(
+            "/pin", json={"id": "919876543210", "messageId": target}, headers=key_header
+        )
+        check("pin accepted", r.status_code == 200, f"got {r.status_code}")
+        check("pin defaults to 24h", store.docs[("default", target)].get("pinDurationSeconds") == 86400)
+
+        r = await client.post(
+            "/unpin", json={"id": "919876543210", "messageId": target}, headers=key_header
+        )
+        check("unpin accepted", r.status_code == 200, f"got {r.status_code}")
+        check(
+            "unpin actually clears the flag",
+            store.docs[("default", target)].get("pinned") is False,
+            str(store.docs[("default", target)].get("pinned")),
+        )
+
+        r = await client.post(
+            "/delete",
+            json={"id": "919876543210", "messageId": target, "forEveryone": True},
+            headers=key_header,
+        )
+        check("delete accepted", r.status_code == 200, f"got {r.status_code}")
+        gone = store.docs[("default", target)]
+        check("the row is marked, not removed", gone.get("deleted") is True and gone.get("body"))
+        check("and says it was for everyone", gone.get("deletedForEveryone") is True)
+
+        # Acting on something older than this bridge must not fail.
+        r = await client.post(
+            "/star", json={"id": "919876543210", "messageId": "NEVER_SEEN", "star": True}, headers=key_header
+        )
+        check("acting on an unarchived message still succeeds", r.status_code == 200, f"got {r.status_code}")
+
+        r = await client.post("/reply", json={"id": "919876543210", "msg": "no target"}, headers=key_header)
+        check("reply without a messageId is refused", r.status_code == 422, f"got {r.status_code}")
+
+        r = await client.post("/react", json={"id": "919876543210", "messageId": "M1", "emoji": "x"})
+        check("the action routes need a key", r.status_code == 401, f"got {r.status_code}")
 
         print("\n-- reads --")
         r = await client.get("/messages", headers=key_header)

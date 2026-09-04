@@ -207,9 +207,53 @@ When the gateway does fail a media send, the bridge names the likely cause rathe
 server-side requests, which is the single most common surprise with `media` — and a byte send names
 the type it was refused as.
 
+### Everything else you can do to a message
+
+Same convention throughout: `id` is the chat — a phone number or a group jid — and `messageId` is
+the WhatsApp id that `/send` and `/messages` hand back.
+
+| Path        | Body                                            | Does                                    |
+| ----------- | ----------------------------------------------- | --------------------------------------- |
+| `/reply`    | `id`, `messageId`, `msg`                        | Reply, quoting that message             |
+| `/react`    | `id`, `messageId`, `emoji`                      | React — `""` removes it                 |
+| `/forward`  | `id`, `from`, `messageId`                       | Forward from one chat to another        |
+| `/location` | `id`, `latitude`, `longitude`, `description?`   | Drop a pin                              |
+| `/contact`  | `id`, `name`, `number`                          | Send a contact card                     |
+| `/poll`     | `id`, `question`, `options[]`                   | Send a poll (2–12 options)              |
+| `/edit`     | `id`, `messageId`, `msg`                        | Change the text of something you sent   |
+| `/delete`   | `id`, `messageId`, `forEveryone?`               | Delete it                               |
+| `/star`     | `id`, `messageId`, `star?`                      | Star, or un-star with `false`           |
+| `/pin`      | `id`, `messageId`, `durationSeconds?`           | Pin for 24h / 7d / 30d                  |
+| `/unpin`    | `id`, `messageId`                               | Unpin                                   |
+
+```bash
+curl -X POST http://localhost:8000/react -H "Authorization: Bearer $BRIDGE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"919876543210","messageId":"true_919876543210@c.us_3EB0ABCD","emoji":"👍"}'
+```
+
+**How these land in MongoDB matters.** The five that *create* a message — reply, forward, location,
+contact, poll — get their own document, like any other send. The six that *change* one — react,
+edit, delete, star, pin — are merged into the row of the message they acted on. Writing a separate
+document for a reaction would leave the archive claiming two messages where the conversation has
+one.
+
+Two consequences worth knowing:
+
+- **`/edit` keeps the old text.** The new body replaces the old one on the row, and the previous
+  version is appended to `editHistory` with a timestamp. An archive that silently rewrote history
+  would be a worse record than the phone it mirrors.
+- **`/delete` marks, it does not remove.** The row gains `deleted`, `deletedForEveryone` and
+  `deletedAt`, and keeps its body. That a message was sent and then withdrawn is exactly the sort of
+  thing an archive exists to remember.
+
+Acting on a message older than this bridge is fine — the send goes through and there is simply no
+row to update.
+
 | Method | Path               | Auth  | Purpose                                                     |
 | ------ | ------------------ | ----- | ----------------------------------------------------------- |
 | `POST` | `/send`            | token | Send text or a file to any chat, by `id`                    |
+| `POST` | *(the 11 above)*   | token | Reply, react, forward, edit, delete, star, pin…             |
 | `GET`  | `/health`          | —     | Mongo + gateway + session state                             |
 | `GET`  | `/messages`        | token | Recent messages from Mongo (`limit`, `chatId`, `direction`) |
 | `GET`  | `/session`         | token | Full session detail                                         |
@@ -381,7 +425,7 @@ bridge/.venv/bin/python bridge/scripts/selftest.py        # Linux
 bridge\.venv\Scripts\python.exe bridge\scripts\selftest.py
 ```
 
-**126 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
+**161 checks**, with MongoDB and the gateway stubbed out, so it sends nothing and needs neither
 running: auth on both header styles, number parsing, the send path, every event branch, media
 detection and filenames, contact resolution, media sending by URL and by upload, byte sniffing,
-and number normalisation.
+every route in the send family, and number normalisation.

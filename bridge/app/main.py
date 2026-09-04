@@ -24,7 +24,23 @@ from . import media
 from . import messages as msg_map
 from .config import get_settings
 from .db import Store, utcnow
-from .models import HealthResponse, SendRequest, SendResponse
+from .models import (
+    ActionResponse,
+    ContactRequest,
+    DeleteRequest,
+    EditRequest,
+    ForwardRequest,
+    HealthResponse,
+    LocationRequest,
+    MessageRequest,
+    PinRequest,
+    PollRequest,
+    ReactRequest,
+    ReplyRequest,
+    SendRequest,
+    SendResponse,
+    StarRequest,
+)
 from .numbers import InvalidNumber, phone_of, to_chat_id
 from .openwa import OpenWAClient, OpenWAError
 from .security import require_api_key, verify_openwa_signature
@@ -146,6 +162,13 @@ async def root() -> dict[str, Any]:
                 "note": "the type is derived from the file's mimetype unless you set `type`",
             },
             "groups": "put the group jid (120363...@g.us) in `id`",
+        },
+        "actions": {
+            "paths": [
+                "/reply", "/react", "/forward", "/location", "/contact",
+                "/poll", "/edit", "/delete", "/star", "/pin", "/unpin",
+            ],
+            "note": "all take `id` (the chat) and, where they act on one, `messageId`",
         },
         "docs": "/docs",
     }
@@ -550,6 +573,263 @@ async def _record_failure(
             "source": "api",
         },
     )
+
+# ---------------------------------------------------------------- actions ---
+#
+# The rest of the send family. Each takes `id` - a phone number or a group jid,
+# the same as /send - and never the gateway's chatId form.
+#
+# Two shapes, and they record differently. One creates a message (reply,
+# location, contact, poll, forward) and gets its own row. The other changes a
+# message that already exists (react, edit, delete, star, pin) and is merged
+# into that row: writing a second document for a reaction would leave the
+# archive claiming two messages where the conversation has one.
+
+
+def _action_chat(raw_id: str) -> str:
+    try:
+        return to_chat_id(raw_id, settings.default_country_code)
+    except InvalidNumber as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _record_created(
+    chat_id: str, result: Any, *, kind: str, body: str, extra: dict[str, Any] | None = None
+) -> tuple[str | None, dict[str, Any]]:
+    """File a message this action brought into being."""
+    message_id = (result or {}).get("messageId")
+    fields: dict[str, Any] = {
+        "direction": "out",
+        "chatId": chat_id,
+        "phone": phone_of(chat_id),
+        "body": body,
+        "type": kind,
+        "fromMe": True,
+        "source": "api",
+    }
+    if extra:
+        fields.update(extra)
+    doc = await store.upsert_message(
+        session_name=settings.openwa_session_name,
+        message_id=message_id,
+        set_fields=fields,
+        on_insert={"status": "sent", "timestamp": utcnow()},
+    )
+    return message_id, doc
+
+
+async def _record_changed(message_id: str, fields: dict[str, Any]) -> bool:
+    """Merge an action's effect into the message it acted on.
+
+    Returns False when the message is not in the archive - which is not an
+    error: you can react to something sent before this bridge ever ran.
+    """
+    return await store.set_fields(
+        session_name=settings.openwa_session_name, message_id=message_id, fields=fields
+    )
+
+
+@app.post("/reply", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def reply(payload: ReplyRequest) -> ActionResponse:
+    """Reply to a message, quoting it."""
+    chat_id = _action_chat(payload.id)
+    result = await openwa.reply(chat_id, payload.messageId, payload.msg)
+    message_id, doc = await _record_created(
+        chat_id,
+        result,
+        kind="text",
+        body=payload.msg,
+        extra={"quotedMessageId": payload.messageId},
+    )
+    log.info("replied in %s to %s (%s)", chat_id, payload.messageId, message_id)
+    return ActionResponse(
+        ok=True,
+        chatId=chat_id,
+        action="reply",
+        messageId=message_id,
+        status=doc.get("status", "sent"),
+        storedId=str(doc.get("_id")) if doc else None,
+    )
+
+
+@app.post("/react", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def react(payload: ReactRequest) -> ActionResponse:
+    """React to a message. An empty `emoji` removes the reaction."""
+    chat_id = _action_chat(payload.id)
+    await openwa.react(chat_id, payload.messageId, payload.emoji)
+    await _record_changed(payload.messageId, {"myReaction": payload.emoji or ""})
+    return ActionResponse(
+        ok=True, chatId=chat_id, action="react", messageId=payload.messageId
+    )
+
+
+@app.post("/forward", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def forward(payload: ForwardRequest) -> ActionResponse:
+    """Forward a message from one chat to another."""
+    to_chat = _action_chat(payload.id)
+    from_chat = _action_chat(payload.from_)
+    result = await openwa.forward(from_chat, to_chat, payload.messageId)
+    message_id, doc = await _record_created(
+        to_chat,
+        result,
+        kind="text",
+        body="",
+        extra={"forwardedFrom": from_chat, "forwardedMessageId": payload.messageId},
+    )
+    return ActionResponse(
+        ok=True,
+        chatId=to_chat,
+        action="forward",
+        messageId=message_id,
+        status=doc.get("status", "sent"),
+        storedId=str(doc.get("_id")) if doc else None,
+    )
+
+
+@app.post("/location", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def send_location(payload: LocationRequest) -> ActionResponse:
+    """Send a pin on the map."""
+    chat_id = _action_chat(payload.id)
+    result = await openwa.send_location(
+        chat_id, payload.latitude, payload.longitude, payload.description, payload.address
+    )
+    message_id, doc = await _record_created(
+        chat_id,
+        result,
+        kind="location",
+        body=payload.description or payload.address or "",
+        extra={
+            "location": {
+                "latitude": payload.latitude,
+                "longitude": payload.longitude,
+                "description": payload.description,
+                "address": payload.address,
+            }
+        },
+    )
+    return ActionResponse(
+        ok=True,
+        chatId=chat_id,
+        action="location",
+        messageId=message_id,
+        status=doc.get("status", "sent"),
+        storedId=str(doc.get("_id")) if doc else None,
+    )
+
+
+@app.post("/contact", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def send_contact(payload: ContactRequest) -> ActionResponse:
+    """Send a contact card. `name` and `number` are the card's, not the recipient's."""
+    chat_id = _action_chat(payload.id)
+    result = await openwa.send_contact(chat_id, payload.name, payload.number)
+    message_id, doc = await _record_created(
+        chat_id,
+        result,
+        kind="contact",
+        body=payload.name,
+        extra={"contactCard": {"name": payload.name, "number": payload.number}},
+    )
+    return ActionResponse(
+        ok=True,
+        chatId=chat_id,
+        action="contact",
+        messageId=message_id,
+        status=doc.get("status", "sent"),
+        storedId=str(doc.get("_id")) if doc else None,
+    )
+
+
+@app.post("/poll", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def send_poll(payload: PollRequest) -> ActionResponse:
+    """Send a poll. Between 2 and 12 options, which is WhatsApp's own limit."""
+    chat_id = _action_chat(payload.id)
+    result = await openwa.send_poll(chat_id, payload.question, payload.options)
+    message_id, doc = await _record_created(
+        chat_id,
+        result,
+        kind="poll",
+        body=payload.question,
+        extra={"poll": {"question": payload.question, "options": payload.options}},
+    )
+    return ActionResponse(
+        ok=True,
+        chatId=chat_id,
+        action="poll",
+        messageId=message_id,
+        status=doc.get("status", "sent"),
+        storedId=str(doc.get("_id")) if doc else None,
+    )
+
+
+@app.post("/edit", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def edit(payload: EditRequest) -> ActionResponse:
+    """Change the text of a message you sent."""
+    chat_id = _action_chat(payload.id)
+    await openwa.edit_message(chat_id, payload.messageId, payload.msg)
+    # The previous text is kept: an archive that silently rewrote history would
+    # be a worse record of the conversation than the phone it mirrors.
+    existing = await store.get_message(
+        session_name=settings.openwa_session_name, message_id=payload.messageId
+    )
+    history = list((existing or {}).get("editHistory") or [])
+    if existing and existing.get("body") is not None:
+        history.append({"body": existing["body"], "replacedAt": utcnow()})
+    await _record_changed(
+        payload.messageId,
+        {"body": payload.msg, "edited": True, "editHistory": history or None},
+    )
+    return ActionResponse(ok=True, chatId=chat_id, action="edit", messageId=payload.messageId)
+
+
+@app.post("/delete", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def delete(payload: DeleteRequest) -> ActionResponse:
+    """Delete a message. `forEveryone` decides whether it goes from their phone too."""
+    chat_id = _action_chat(payload.id)
+    await openwa.delete_message(chat_id, payload.messageId, payload.forEveryone)
+    # Marked, not removed. The row is the record that it was sent and then
+    # withdrawn, which is the part an archive exists to keep.
+    await _record_changed(
+        payload.messageId,
+        {
+            "deleted": True,
+            "deletedForEveryone": payload.forEveryone,
+            "deletedAt": utcnow(),
+        },
+    )
+    return ActionResponse(ok=True, chatId=chat_id, action="delete", messageId=payload.messageId)
+
+
+@app.post("/star", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def star(payload: StarRequest) -> ActionResponse:
+    """Star a message, or un-star it with `"star": false`."""
+    chat_id = _action_chat(payload.id)
+    await openwa.star_message(chat_id, payload.messageId, payload.star)
+    await _record_changed(payload.messageId, {"starred": payload.star})
+    return ActionResponse(ok=True, chatId=chat_id, action="star", messageId=payload.messageId)
+
+
+@app.post("/pin", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def pin(payload: PinRequest) -> ActionResponse:
+    """Pin a message for 24h, 7d or 30d (86400, 604800, 2592000 seconds)."""
+    chat_id = _action_chat(payload.id)
+    await openwa.pin_message(chat_id, payload.messageId, payload.durationSeconds)
+    await _record_changed(
+        payload.messageId,
+        {"pinned": True, "pinDurationSeconds": payload.durationSeconds or 86400},
+    )
+    return ActionResponse(ok=True, chatId=chat_id, action="pin", messageId=payload.messageId)
+
+
+@app.post("/unpin", response_model=ActionResponse, dependencies=[Depends(require_api_key)])
+async def unpin(payload: MessageRequest) -> ActionResponse:
+    """Unpin a message."""
+    chat_id = _action_chat(payload.id)
+    await openwa.unpin_message(chat_id, payload.messageId)
+    # False, not None: set_fields drops None, which would leave the row still
+    # claiming the message is pinned.
+    await _record_changed(payload.messageId, {"pinned": False})
+    return ActionResponse(ok=True, chatId=chat_id, action="unpin", messageId=payload.messageId)
+
 
 # ----------------------------------------------------------------- media ---
 

@@ -92,3 +92,165 @@ class HealthResponse(BaseModel):
     openwa: bool
     session: dict[str, Any] | None = None
     detail: str | None = None
+
+
+# --------------------------------------------------------------------------
+# The rest of the send family
+#
+# Every one of these names the chat as `id`, exactly as POST /send does - a
+# phone number or a group jid, never the gateway's chatId form. The bridge
+# converts. `messageId` is the WhatsApp id of the message being acted on, which
+# is what /send and /messages both hand back.
+# --------------------------------------------------------------------------
+
+ID_ALIASES = ("number", "to", "phone", "chatId", "chat")
+MESSAGE_ALIASES = ("msgId", "message_id", "messageID", "waMessageId")
+
+
+def _alias(data: Any, target: str, aliases: tuple[str, ...]) -> Any:
+    if not isinstance(data, dict):
+        return data
+    data = dict(data)
+    if target not in data or data.get(target) in (None, ""):
+        for name in aliases:
+            if data.get(name):
+                data[target] = data[name]
+                break
+    return data
+
+
+class ChatRequest(BaseModel):
+    """Anything addressed to a chat."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., description="Phone number with country code, or a group jid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ids(cls, data: Any) -> Any:
+        return _alias(data, "id", ID_ALIASES)
+
+
+class MessageRequest(ChatRequest):
+    """Anything acting on one existing message in a chat."""
+
+    messageId: str = Field(..., description="The WhatsApp message id, as returned by /send")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _message_ids(cls, data: Any) -> Any:
+        return _alias(_alias(data, "id", ID_ALIASES), "messageId", MESSAGE_ALIASES)
+
+
+class ReplyRequest(MessageRequest):
+    msg: str = Field(..., min_length=1, max_length=4096, description="The reply text")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reply(cls, data: Any) -> Any:
+        data = _alias(_alias(data, "id", ID_ALIASES), "messageId", MESSAGE_ALIASES + ("quotedMessageId", "replyTo"))
+        return _alias(data, "msg", ("message", "text", "body"))
+
+
+class ReactRequest(MessageRequest):
+    emoji: str = Field(
+        ...,
+        max_length=64,
+        description="The emoji to react with. An empty string removes the reaction.",
+    )
+
+
+class ForwardRequest(MessageRequest):
+    """`id` is where it goes; `from` is the chat it is already in."""
+
+    from_: str = Field(..., alias="from", description="The chat the message is currently in")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _forward(cls, data: Any) -> Any:
+        data = _alias(_alias(data, "id", ID_ALIASES), "messageId", MESSAGE_ALIASES)
+        return _alias(data, "from", ("fromChatId", "fromId", "source"))
+
+
+class LocationRequest(ChatRequest):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    description: str | None = Field(None, max_length=1024)
+    address: str | None = Field(None, max_length=1024)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _location(cls, data: Any) -> Any:
+        data = _alias(data, "id", ID_ALIASES)
+        data = _alias(data, "latitude", ("lat",))
+        return _alias(data, "longitude", ("lng", "lon", "long"))
+
+
+class ContactRequest(ChatRequest):
+    """A contact card. `name` and `number` are the card's, not the recipient's."""
+
+    name: str = Field(..., min_length=1, max_length=255, description="Name on the contact card")
+    number: str = Field(..., min_length=1, max_length=32, description="Number on the contact card")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _contact(cls, data: Any) -> Any:
+        data = _alias(data, "id", ID_ALIASES)
+        data = _alias(data, "name", ("contactName",))
+        return _alias(data, "number", ("contactNumber",))
+
+
+class PollRequest(ChatRequest):
+    question: str = Field(..., min_length=1, max_length=255)
+    options: list[str] = Field(..., description="Between 2 and 12 answers, WhatsApp's own limit")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _poll(cls, data: Any) -> Any:
+        data = _alias(data, "id", ID_ALIASES)
+        return _alias(data, "question", ("name", "title", "msg", "text"))
+
+    @model_validator(mode="after")
+    def _option_count(self) -> "PollRequest":
+        cleaned = [o.strip() for o in self.options if o and o.strip()]
+        if not 2 <= len(cleaned) <= 12:
+            raise ValueError(f"a poll needs between 2 and 12 options (got {len(cleaned)})")
+        self.options = cleaned
+        return self
+
+
+class EditRequest(MessageRequest):
+    msg: str = Field(..., min_length=1, max_length=4096, description="The replacement text")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _edit(cls, data: Any) -> Any:
+        data = _alias(_alias(data, "id", ID_ALIASES), "messageId", MESSAGE_ALIASES)
+        return _alias(data, "msg", ("message", "text", "body"))
+
+
+class DeleteRequest(MessageRequest):
+    forEveryone: bool = Field(
+        False,
+        description="True deletes it for everyone in the chat; false only for you",
+    )
+
+
+class StarRequest(MessageRequest):
+    star: bool = Field(True, description="False un-stars it")
+
+
+class PinRequest(MessageRequest):
+    durationSeconds: int | None = Field(
+        None, description="86400 (24h), 604800 (7d) or 2592000 (30d). Defaults to 24h."
+    )
+
+
+class ActionResponse(BaseModel):
+    ok: bool
+    chatId: str
+    action: str
+    messageId: str | None = None
+    status: str | None = None
+    storedId: str | None = None
