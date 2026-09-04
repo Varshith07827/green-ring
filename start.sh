@@ -347,11 +347,24 @@ if [[ ! -d "$REPO/dashboard/dist" ]]; then
   (cd "$REPO" && npm run dashboard:build) || warn "dashboard build failed - the API still works, the web UI will not"
 fi
 
+# The venv is only built once, so a pull that adds a dependency would leave it
+# missing until someone deleted .venv by hand - and the failure surfaces at
+# request time, deep in a library, saying nothing about an install step. Stamp
+# the requirements and reinstall when they move.
+REQ_FILE="$BRIDGE/requirements.txt"
+REQ_STAMP="$BRIDGE/.venv/.requirements-sha256"
+req_hash() { sha256sum "$REQ_FILE" 2>/dev/null | cut -d' ' -f1; }
+
 if [[ ! -x "$VENV_PY" ]]; then
   step "Creating the Python environment (first run only)"
   python3 -m venv "$BRIDGE/.venv"
   "$VENV_PY" -m pip install --upgrade pip --quiet
-  "$VENV_PY" -m pip install -r "$BRIDGE/requirements.txt"
+  "$VENV_PY" -m pip install -r "$REQ_FILE"
+  req_hash > "$REQ_STAMP"
+elif [[ "$(cat "$REQ_STAMP" 2>/dev/null)" != "$(req_hash)" ]]; then
+  step "Python dependencies changed - installing"
+  "$VENV_PY" -m pip install -r "$REQ_FILE"
+  req_hash > "$REQ_STAMP"
 fi
 
 if [[ "$SETUP_ONLY" == true ]]; then

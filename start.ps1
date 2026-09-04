@@ -343,6 +343,16 @@ if (-not (Test-Path (Join-Path $repo "dashboard\dist"))) {
     Pop-Location
 }
 
+# The venv is built once, so a pull that adds a dependency would leave it
+# missing until someone deleted .venv by hand - and it surfaces at request time,
+# deep in a library, saying nothing about an install step. Stamp the
+# requirements and reinstall when they move.
+$reqFile  = Join-Path $bridge "requirements.txt"
+$reqStamp = Join-Path $bridge ".venv\.requirements-sha256"
+$reqHash  = (Get-FileHash -Algorithm SHA256 $reqFile).Hash
+$haveHash = ""
+if (Test-Path $reqStamp) { $haveHash = (Get-Content $reqStamp -Raw).Trim() }
+
 if (-not (Test-Path $python)) {
     Write-Host "Creating the Python environment (first run only)..." -ForegroundColor Cyan
     Push-Location $bridge
@@ -351,6 +361,15 @@ if (-not (Test-Path $python)) {
     & $python -m pip install -r requirements.txt
     if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Error "pip install failed" }
     Pop-Location
+    Set-Content -Path $reqStamp -Value $reqHash -Encoding utf8
+}
+elseif ($haveHash -ne $reqHash) {
+    Write-Host "Python dependencies changed - installing..." -ForegroundColor Cyan
+    Push-Location $bridge
+    & $python -m pip install -r requirements.txt
+    if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Error "pip install failed" }
+    Pop-Location
+    Set-Content -Path $reqStamp -Value $reqHash -Encoding utf8
 }
 
 # ---- start both processes ------------------------------------------------
